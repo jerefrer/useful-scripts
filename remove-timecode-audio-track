@@ -1,0 +1,168 @@
+#!/bin/bash
+
+# Display usage if no arguments provided
+if [ $# -eq 0 ]; then
+    echo "Usage: $0 <folder>"
+    echo "Example: $0 \"20241212 KSDF\""
+    echo "This will process all .mov files in TC2 subfolders and create corresponding TC3 folders"
+    exit 1
+fi
+
+input_base="$1"
+parent_dir=$(dirname "$input_base")
+status_file="$parent_dir/.tc2_to_tc3_status"
+partial_file="$parent_dir/.tc2_to_tc3_partial"
+
+# Function to clean up on exit
+cleanup() {
+    local exit_code=$?
+    if [ $exit_code -ne 0 ] && [ -f "$partial_file" ]; then
+        current_processing=$(cat "$partial_file")
+        echo "PARTIAL:$current_processing" >> "$status_file"
+        echo -e "\nScript interrupted. Last file being processed was: $current_processing"
+        echo "Run the script again to resume processing."
+    fi
+    rm -f "$partial_file"
+    exit $exit_code
+}
+
+trap cleanup INT TERM EXIT
+
+# Function to format time in HH:MM:SS
+format_time() {
+    printf "%02d:%02d:%02d" $((${1}/3600)) $((${1}%3600/60)) $((${1}%60))
+}
+
+# Check if input base folder exists
+if [ ! -d "$input_base" ]; then
+    echo "Error: Input folder '$input_base' does not exist"
+    exit 1
+fi
+
+tc3_base="$parent_dir/TC3"
+mkdir -p "$tc3_base"
+
+# Function to check if file was already processed
+is_processed() {
+    local file="$1"
+    if [ -f "$status_file" ]; then
+        grep -q "^DONE:$file\$" "$status_file"
+        return $?
+    fi
+    return 1
+}
+
+# Function to check if file was partially processed
+is_partial() {
+    local file="$1"
+    if [ -f "$status_file" ]; then
+        grep -q "^PARTIAL:$file\$" "$status_file"
+        return $?
+    fi
+    return 1
+}
+
+# Count total .mov files to process
+total_files=$(find "$input_base" -type d -name "*TC2" -exec find {} -type f -name "*.mov" \; | wc -l | tr -d ' ')
+current_file=0
+
+# Function to get file size in bytes
+get_file_size() {
+    stat -f %z "$1"
+}
+
+# Function to summarize total size and get list of files
+get_job_info() {
+    local folder="$1"
+    local total_size=0
+    local file_list=""
+    
+    while IFS= read -r tc2_folder; do
+        while IFS= read -r file; do
+            [ -e "$file" ] || continue
+            if ! is_processed "$file"; then
+                size=$(get_file_size "$file")
+                total_size=$((total_size + size))
+                file_list="$file_list$file:$size\n"
+            fi
+        done < <(find "$tc2_folder" -type f -name "*.mov")
+    done < <(find "$folder" -type d -name "*TC2")
+    
+    echo -e "$total_size\n$file_list"
+}
+
+# Get initial job information
+job_info=$(get_job_info "$input_base")
+total_bytes=$(echo "$job_info" | head -n1)
+file_list=$(echo "$job_info" | tail -n +2)
+bytes_processed=0
+time_per_gb=0
+
+echo "Total data to process: $(numfmt --to=iec-i --suffix=B $total_bytes)"
+
+# Process files
+find "$input_base" -type d -name "*TC2" | while read -r tc2_folder; do
+    rel_path=${tc2_folder#"$input_base/"}
+    tc3_folder="$tc3_base/${rel_path/TC2/TC3}"
+    
+    echo -e "\nProcessing folder: $tc2_folder -> $tc3_folder"
+    mkdir -p "$tc3_folder"
+    
+    # Only process .mov files
+    for file in "$tc2_folder"/*.mov; do
+        # Skip if no .mov files found
+        [ -e "$file" ] || continue
+        
+        ((current_file++))
+        filename=$(basename "$file")
+        newname=${filename/_no_corresponding_files_tentacle/}
+        output_path="$tc3_folder/$newname"
+        current_size=$(get_file_size "$file")
+        
+        # Skip if already successfully processed
+        if is_processed "$file"; then
+            echo -e "\nSkipping already processed file: $file"
+            bytes_processed=$((bytes_processed + current_size))
+            continue
+        fi
+        
+        # Check if file was partially processed before
+        if is_partial "$file"; then
+            echo -e "\nRetrying partially processed file: $file"
+        fi
+        
+        echo -e "\nProcessing ($current_file/$total_files): $filename -> $newname"
+        echo "File size: $(numfmt --to=iec-i --suffix=B $current_size)"
+        
+        # Rest of the ffmpeg processing remains the same until after ffmpeg finishes
+        
+        # After successful processing, update time estimation
+        if [ $ffmpeg_status -eq 0 ]; then
+            processing_time=$(($(date +%s) - start_time))
+            bytes_processed=$((bytes_processed + current_size))
+            
+            # Update average processing speed (bytes per second)
+            if [ $processing_time -gt 0 ]; then
+                time_per_gb=$((processing_time * 1000000000 / current_size))
+                bytes_remaining=$((total_bytes - bytes_processed))
+                estimated_remaining=$((bytes_remaining * time_per_gb / 1000000000))
+                
+                echo "Processed: $(numfmt --to=iec-i --suffix=B $bytes_processed) / $(numfmt --to=iec-i --suffix=B $total_bytes)"
+                echo "Average processing speed: $(numfmt --to=iec-i --suffix=B/s $((current_size / processing_time)))"
+                echo "Estimated time remaining: $(format_time $estimated_remaining)"
+            fi
+            
+            echo "DONE:$file" >> "$status_file"
+            rm -f "$partial_file"
+        else
+            echo -e "\nError processing file"
+            echo "PARTIAL:$file" >> "$status_file"
+            cat "$ffmpeg_output"
+        fi
+        
+        rm -f "$progress_file" "$ffmpeg_output"
+    done
+done
+
+rm -f "$partial_file"
+echo -e "\nAll processing complete!"

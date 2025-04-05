@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import sys
 import csv
 import re
@@ -11,36 +10,61 @@ def sanitize_filename(filename):
     """Replace problematic characters with ' - ' in filenames"""
     return re.sub(r'[:\\/*?"<>|]', ' - ', filename)
 
-def generate_number(existing, index):
-    """Generate or clean up line number"""
-    if existing and isinstance(existing, str):
-        # Keep existing number if it's valid
-        return existing.strip()
-    # Generate new number padded to 2 digits
-    return f"{index+1:02d}"
+def clean_quality(quality):
+    """Convert quality string to numeric value"""
+    quality_value = quality.rstrip('pP')
+    if not quality_value.isdigit():
+        sys.exit(f"Error: Invalid quality value '{quality}'")
+    return quality_value
 
-def process_csv(input_file, quality="720p"):
+def process_csv(input_file, quality="720", destination_directory=None):
+    if destination_directory:
+        Path(destination_directory).mkdir(parents=True, exist_ok=True)
+    
     try:
         with open(input_file, 'r', encoding='utf-8') as f:
             reader = csv.reader(f, delimiter=';')
-            for i, row in enumerate(reader):
-                if len(row) < 3:
+            rows = list(reader)
+            
+            # Determine if we have 2 or 3 columns
+            if not rows:
+                sys.exit("Error: Empty input file")
+                
+            col_count = len(rows[0])
+            if col_count not in [2, 3]:
+                sys.exit(f"Error: Expected 2 or 3 columns, found {col_count}")
+            
+            for i, row in enumerate(rows):
+                if len(row) != col_count:
                     print(f"Skipping malformed line {i+1}: {row}")
                     continue
                 
-                number = generate_number(row[0], i)
-                filename = sanitize_filename(row[1])
-                url = row[2].strip()
+                # If 2 columns: number & url
+                # If 3 columns: custom_number, name & url
+                if col_count == 2:
+                    name, url = row
+                    number = f"{i+1:02d}"
+                else:
+                    number, name, url = row
+                    number = number.strip()
+                    if not number:  # Handle empty number field
+                        number = f"{i+1:02d}"
                 
-                # Construct yt-dlp command
+                name = sanitize_filename(name)
+                url = url.strip()
+                
+                output_template = f"{number} - {name}.%(ext)s"
+                if destination_directory:
+                    output_template = str(Path(destination_directory) / output_template)
+                
                 cmd = [
                     "yt-dlp",
-                    "-f", f"bestvideo[height<={quality[:-1]}]+bestaudio/best[height<={quality[:-1]}]",
-                    "-o", f"{number}. {filename}.%(ext)s",
+                    "-f", f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]",
+                    "-o", output_template,
                     url
                 ]
                 
-                print(f"Processing {number}: {filename}")
+                print(f"Processing {number}: {name}")
                 subprocess.run(cmd)
                 
     except FileNotFoundError:
@@ -53,10 +77,12 @@ def process_csv(input_file, quality="720p"):
 def main():
     parser = argparse.ArgumentParser(description='Process video downloads from CSV file')
     parser.add_argument('input_file', help='Input CSV file (semicolon-separated)')
-    parser.add_argument('--quality', default='720p', help='Video quality (default: 720p)')
+    parser.add_argument('--quality', default='720', help='Video quality (default: 720). Can use "720", "720p", "1080", "1080p" etc.')
+    parser.add_argument('--dir', help='Destination directory')
     
     args = parser.parse_args()
-    process_csv(args.input_file, args.quality)
+    quality = clean_quality(args.quality)
+    process_csv(args.input_file, quality, args.dir)
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+import os
+import hashlib
+from pathlib import Path
+from datetime import datetime
+import argparse
+from typing import Dict, Set, Tuple
+
+class FolderComparer:
+    def __init__(self, source_path: str, target_path: str, verify_hashes: bool = False):
+        self.source_path = Path(source_path).resolve()
+        self.target_path = Path(target_path).resolve()
+        self.verify_hashes = verify_hashes
+        self.media_extensions = {
+            '.mp4', '.mov', '.avi', '.mkv',  # video
+            '.mp3', '.wav', '.aac', '.m4a', '.flac'  # audio
+        }
+        
+    def get_file_info(self, path: Path) -> Dict[str, Tuple[int, str]]:
+        """
+        Returns a dictionary of relative file paths to (size, hash) tuples
+        """
+        files_info = {}
+        
+        for file_path in path.rglob('*'):
+            if file_path.is_file() and file_path.suffix.lower() in self.media_extensions:
+                relative_path = str(file_path.relative_to(path))
+                size = file_path.stat().st_size
+                
+                if self.verify_hashes:
+                    file_hash = self._calculate_hash(file_path)
+                else:
+                    file_hash = ""
+                    
+                files_info[relative_path] = (size, file_hash)
+                
+        return files_info
+    
+    def _calculate_hash(self, file_path: Path, chunk_size: int = 8192) -> str:
+        """Calculate MD5 hash of a file"""
+        md5 = hashlib.md5()
+        with open(file_path, 'rb') as f:
+            while chunk := f.read(chunk_size):
+                md5.update(chunk)
+        return md5.hexdigest()
+    
+    def compare_folders(self) -> Tuple[Set[str], Set[str], Set[str], Set[str]]:
+        """
+        Compare folders and return sets of:
+        - missing_files: files in source but not in target
+        - extra_files: files in target but not in source
+        - size_mismatches: files present in both but with different sizes
+        - hash_mismatches: files present in both but with different hashes
+        """
+        source_files = self.get_file_info(self.source_path)
+        target_files = self.get_file_info(self.target_path)
+        
+        source_paths = set(source_files.keys())
+        target_paths = set(target_files.keys())
+        
+        missing_files = source_paths - target_paths
+        extra_files = target_paths - source_paths
+        
+        size_mismatches = set()
+        hash_mismatches = set()
+        
+        # Check files present in both locations
+        common_files = source_paths & target_paths
+        for file in common_files:
+            source_size, source_hash = source_files[file]
+            target_size, target_hash = target_files[file]
+            
+            if source_size != target_size:
+                size_mismatches.add(file)
+            elif self.verify_hashes and source_hash != target_hash:
+                hash_mismatches.add(file)
+                
+        return missing_files, extra_files, size_mismatches, hash_mismatches
+
+def main():
+    parser = argparse.ArgumentParser(description='Compare media files between two folders')
+    parser.add_argument('source', help='Source folder path')
+    parser.add_argument('target', help='Target folder path')
+    parser.add_argument('--verify-hashes', action='store_true', 
+                       help='Verify file integrity using MD5 hashes (slower)')
+    parser.add_argument('--output', help='Output file for results')
+    args = parser.parse_args()
+    
+    comparer = FolderComparer(args.source, args.target, args.verify_hashes)
+    missing, extra, size_diff, hash_diff = comparer.compare_folders()
+    
+    # Prepare results
+    results = [
+        f"Folder Comparison Results - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"\nSource: {args.source}",
+        f"Target: {args.target}",
+        f"\nMissing files (in source but not target): {len(missing)}",
+        *[f"  - {f}" for f in sorted(missing)],
+        f"\nExtra files (in target but not source): {len(extra)}",
+        *[f"  - {f}" for f in sorted(extra)],
+        f"\nSize mismatches: {len(size_diff)}",
+        *[f"  - {f}" for f in sorted(size_diff)],
+    ]
+    
+    if args.verify_hashes:
+        results.extend([
+            f"\nHash mismatches: {len(hash_diff)}",
+            *[f"  - {f}" for f in sorted(hash_diff)]
+        ])
+    
+    # Output results
+    output_text = '\n'.join(results)
+    if args.output:
+        with open(args.output, 'w') as f:
+            f.write(output_text)
+    else:
+        print(output_text)
+        
+    # Return status code based on whether any differences were found
+    return 1 if any([missing, extra, size_diff, hash_diff]) else 0
+
+if __name__ == '__main__':
+    exit(main())

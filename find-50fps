@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+from pathlib import Path
+import json
+import argparse
+
+def get_video_fps(file_path):
+    """
+    Get the frame rate of a video file using ffprobe
+    Returns None if the file is not a video or if there's an error
+    """
+    try:
+        # Construct ffprobe command to get stream information
+        cmd = [
+            'ffprobe',
+            '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=r_frame_rate',
+            '-of', 'json',
+            str(file_path)
+        ]
+        
+        # Run ffprobe and capture output
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            return None
+            
+        # Parse the JSON output
+        data = json.loads(result.stdout)
+        
+        if not data.get('streams'):
+            return None
+            
+        # Get the frame rate fraction (usually in the format "num/den")
+        frame_rate = data['streams'][0].get('r_frame_rate', '')
+        
+        if not frame_rate or '/' not in frame_rate:
+            return None
+            
+        # Calculate the actual frame rate
+        num, den = map(float, frame_rate.split('/'))
+        return num / den if den != 0 else None
+        
+    except (subprocess.SubprocessError, json.JSONDecodeError, ValueError):
+        return None
+
+def is_video_file(file_path):
+    """
+    Check if the file has a video extension
+    """
+    video_extensions = {
+        '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv',
+        '.webm', '.m4v', '.mpg', '.mpeg', '.3gp', '.3g2'
+    }
+    return file_path.suffix.lower() in video_extensions
+
+def find_high_fps_videos(directory, min_fps=30):
+    """
+    Recursively find video files with frame rate higher than min_fps
+    and print them as they are found
+    """
+    directory = Path(directory)
+    count = 0
+    
+    for file_path in directory.rglob('*'):
+        if file_path.is_file() and is_video_file(file_path):
+            fps = get_video_fps(file_path)
+            if fps and fps > min_fps:
+                print(f"{fps:.2f} FPS: {file_path}")
+                count += 1
+    
+    return count
+
+def main():
+    parser = argparse.ArgumentParser(description='Find video files with frame rate higher than specified FPS')
+    parser.add_argument('directory', help='Directory to search in')
+    parser.add_argument('--min-fps', type=float, default=30,
+                      help='Minimum frame rate threshold (default: 30)')
+    args = parser.parse_args()
+    
+    try:
+        # Check if ffprobe is available
+        subprocess.run(['ffprobe', '-version'], capture_output=True, check=True)
+    except (subprocess.SubprocessError, FileNotFoundError):
+        print("Error: ffprobe not found. Please install ffmpeg/ffprobe first.")
+        return
+    
+    print(f"Searching for videos with more than {args.min_fps} FPS in {args.directory}")
+    print("This may take a while depending on the number of files...")
+    
+    count = find_high_fps_videos(args.directory, args.min_fps)
+    
+    if count == 0:
+        print("\nNo videos found with frame rate higher than specified threshold.")
+    else:
+        print(f"\nFound {count} videos with frame rate higher than {args.min_fps} FPS.")
+
+if __name__ == "__main__":
+    main()

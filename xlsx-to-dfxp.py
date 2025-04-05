@@ -1,0 +1,274 @@
+import xml.etree.ElementTree as ET
+import argparse
+import os
+import re
+import openpyxl
+from copy import deepcopy
+
+def convert_newlines_to_br(text):
+    """Convert newlines in text to <br/> tags for DFXP."""
+    if text and '\n' in text:
+        lines = text.split('\n')
+        # Join with <br/> tags
+        return '<br/>'.join(lines)
+    return text
+
+def is_empty(value):
+    """Check if a value is effectively empty."""
+    if value is None:
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    return False
+
+def convert_xlsx_to_dfxp(xlsx_file, dfxp_template, output_dfxp):
+    """
+    Convert an XLSX file back to DFXP format.
+    
+    Args:
+        xlsx_file: Path to the XLSX file containing subtitles
+        dfxp_template: Path to the original DFXP file to use as template (mandatory)
+        output_dfxp: Path to save the output DFXP file
+    """
+    try:
+        # Ensure template exists
+        if not os.path.exists(dfxp_template):
+            print(f"Error: Template DFXP file not found: {dfxp_template}")
+            return False
+        
+        # Load the Excel workbook
+        wb = openpyxl.load_workbook(xlsx_file)
+        ws = wb.active
+        
+        # Extract headers and find column indices
+        headers = [cell.value for cell in ws[1]]
+        
+        try:
+            id_col = headers.index('ID') + 1
+        except ValueError:
+            id_col = headers.index('id') + 1
+        
+        try:
+            begin_col = headers.index('Begin') + 1
+        except ValueError:
+            begin_col = headers.index('begin') + 1
+        
+        try:
+            end_col = headers.index('End') + 1
+        except ValueError:
+            end_col = headers.index('end') + 1
+        
+        try:
+            region_col = headers.index('Region') + 1
+        except ValueError:
+            region_col = headers.index('region') + 1
+        
+        try:
+            original_col = headers.index('Original') + 1
+        except ValueError:
+            original_col = headers.index('original') + 1
+        
+        try:
+            translation_col = headers.index('Translation') + 1
+        except ValueError:
+            translation_col = headers.index('translation') + 1
+        
+        # Load subtitles from Excel
+        subtitles = []
+        for row in range(2, ws.max_row + 1):
+            subtitle_id = ws.cell(row=row, column=id_col).value
+            begin_time = ws.cell(row=row, column=begin_col).value
+            end_time = ws.cell(row=row, column=end_col).value
+            region = ws.cell(row=row, column=region_col).value
+            original_text = ws.cell(row=row, column=original_col).value
+            translation_text = ws.cell(row=row, column=translation_col).value
+            
+            # Use translation if available, otherwise use original
+            text = translation_text if not is_empty(translation_text) else original_text
+            
+            # Skip entries with no text
+            if is_empty(text):
+                continue
+                
+            subtitles.append({
+                'id': subtitle_id,
+                'begin': begin_time,
+                'end': end_time,
+                'region': region,
+                'text': text
+            })
+        
+        # Check if we have subtitles to process
+        if not subtitles:
+            print("No valid subtitle entries found in the Excel file.")
+            return False
+            
+        print(f"Loaded {len(subtitles)} subtitle entries from {xlsx_file}")
+        
+        # Load the template DFXP file
+        try:
+            tree = ET.parse(dfxp_template)
+            root = tree.getroot()
+            print(f"Using template: {dfxp_template}")
+        except Exception as e:
+            print(f"Error parsing template file: {e}")
+            return False
+        
+        # Define namespaces
+        namespaces = {
+            'tt': 'http://www.w3.org/ns/ttml',
+            'tts': 'http://www.w3.org/ns/ttml#styling',
+            'ttp': 'http://www.w3.org/ns/ttml#parameter'
+        }
+        
+        # Find body and div elements in the template
+        body = None
+        div = None
+        
+        # Try to find body with namespaces
+        try:
+            body_elems = root.findall('.//tt:body', namespaces)
+            if body_elems:
+                body = body_elems[0]
+        except:
+            pass
+            
+        # Try without namespaces
+        if not body:
+            try:
+                body_elems = root.findall('.//body')
+                if body_elems:
+                    body = body_elems[0]
+            except:
+                pass
+        
+        if not body:
+            print("Error: Could not find body element in template file")
+            return False
+        
+        # Similarly for div
+        try:
+            div_elems = body.findall('.//tt:div', namespaces)
+            if div_elems:
+                div = div_elems[0]
+        except:
+            pass
+            
+        if not div:
+            try:
+                div_elems = body.findall('.//div')
+                if div_elems:
+                    div = div_elems[0]
+            except:
+                pass
+        
+        if not div:
+            print("Error: Could not find div element in template file")
+            return False
+        
+        # Clear existing content in the div
+        for child in list(div):
+            div.remove(child)
+        
+        # Add updated subtitles
+        for subtitle in subtitles:
+            # Create a new p element
+            p = ET.SubElement(div, '{http://www.w3.org/ns/ttml}p')
+            
+            # Set attributes
+            if subtitle['id']:
+                p.set('{http://www.w3.org/XML/1998/namespace}id', str(subtitle['id']))
+            
+            if subtitle['begin']:
+                p.set('begin', str(subtitle['begin']))
+            
+            if subtitle['end']:
+                p.set('end', str(subtitle['end']))
+            
+            if subtitle['region'] and subtitle['region'] != 'default':
+                p.set('region', subtitle['region'])
+            
+            # Handle text with potential BR tags
+            text = subtitle['text']
+            if '<br/>' in text or '<br>' in text:
+                # Text already has BR tags - use it directly with some cleanup
+                text = text.replace('<br>', '<br/>')
+                
+                # We need to parse this as XML
+                try:
+                    text_elem = ET.fromstring(f"<wrapper>{text}</wrapper>")
+                    p.text = text_elem.text
+                    for child in text_elem:
+                        p.append(child)
+                except Exception:
+                    # If parsing fails, convert to plain text
+                    text = re.sub(r'<br\s*/?>', '\n', text)
+                    text = re.sub(r'<[^>]+>', '', text)  # Remove other tags
+                    p.text = convert_newlines_to_br(text)
+            else:
+                # Text might have newlines that need to be converted to BR tags
+                processed_text = convert_newlines_to_br(text)
+                
+                if '<br/>' in processed_text:
+                    # Need to handle BR tags properly
+                    parts = processed_text.split('<br/>')
+                    if parts:
+                        p.text = parts[0]
+                        
+                        for i in range(1, len(parts)):
+                            br = ET.SubElement(p, '{http://www.w3.org/ns/ttml}br')
+                            br.tail = parts[i]
+                else:
+                    # Simple text without BR tags
+                    p.text = processed_text
+        
+        # Register namespaces for clean output
+        ET.register_namespace('', 'http://www.w3.org/ns/ttml')
+        ET.register_namespace('ttp', 'http://www.w3.org/ns/ttml#parameter')
+        ET.register_namespace('tts', 'http://www.w3.org/ns/ttml#styling')
+        ET.register_namespace('ttm', 'http://www.w3.org/ns/ttml#metadata')
+        ET.register_namespace('xml', 'http://www.w3.org/XML/1998/namespace')
+        
+        # Write the result to the output file
+        tree = ET.ElementTree(root)
+        tree.write(output_dfxp, encoding='utf-8', xml_declaration=True)
+        print(f"Successfully created DFXP file with {len(subtitles)} subtitles: {output_dfxp}")
+        return True
+        
+    except Exception as e:
+        print(f"Error converting XLSX to DFXP: {e}")
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description='Convert XLSX file back to DFXP format')
+    parser.add_argument('--template', '-t', required=True, help='Original DFXP template file (mandatory)')
+    parser.add_argument('--input', '-i', required=True, help='Input XLSX file')
+    parser.add_argument('--output', '-o', help='Output DFXP file (default: based on XLSX name)')
+    
+    args = parser.parse_args()
+    
+    xlsx_file = args.input
+    if not os.path.exists(xlsx_file):
+        print(f"Error: XLSX file not found: {xlsx_file}")
+        return
+    
+    template_file = args.template
+    
+    # Determine output file
+    output_file = args.output
+    if not output_file:
+        base_name = os.path.splitext(xlsx_file)[0]
+        output_file = f"{base_name}_translated.dfxp"
+    
+    print(f"Converting {xlsx_file} to DFXP format...")
+    print(f"Using template: {template_file}")
+    
+    success = convert_xlsx_to_dfxp(xlsx_file, template_file, output_file)
+    
+    if success:
+        print(f"Conversion completed successfully: {output_file}")
+    else:
+        print("Conversion failed.")
+
+if __name__ == "__main__":
+    main()

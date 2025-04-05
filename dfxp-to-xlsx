@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+
+import xml.etree.ElementTree as ET
+import argparse
+import os
+import re
+import html
+import unicodedata
+import openpyxl
+from openpyxl.styles import Font, Alignment, PatternFill
+from openpyxl.utils import get_column_letter
+
+def normalize_unicode(text):
+    """
+    Process text to handle encoding issues without removing any characters.
+    This function preserves all characters including control characters.
+    """
+    if text is None:
+        return ""
+    
+    # Only perform basic normalization to ensure consistency
+    # Uses canonical decomposition and composition (NFC)
+    # which preserves the visual form while standardizing equivalent characters
+    return unicodedata.normalize('NFC', text)
+
+def parse_time(time_str, frame_rate=25):
+    """
+    Parse DFXP/TTML time format to seconds.
+    Handles multiple formats including:
+    - HH:MM:SS:FF (frames)
+    - HH:MM:SS.ms (milliseconds)
+    - Ns (seconds with optional decimal)
+    """
+    # Handle seconds format (e.g., "1.038s")
+    if isinstance(time_str, str) and time_str.endswith('s'):
+        return time_str  # Keep original format
+    
+    # Handle frames format (HH:MM:SS:FF)
+    if isinstance(time_str, str) and ':' in time_str and len(time_str.split(':')) > 3:
+        return time_str  # Keep original format
+    
+    # For all other formats, keep as is
+    return time_str
+
+def extract_text_from_p_element(p_elem):
+    """Extract text content from a p element, handling <br/> tags and character encoding."""
+    # Convert p_elem to string and process
+    try:
+        # First try to get the text using Element methods
+        text = ""
+        if p_elem.text:
+            text += normalize_unicode(p_elem.text)
+        
+        for child in p_elem:
+            if child.tag.endswith('br'):
+                text += '\n'
+            if child.tail:
+                text += normalize_unicode(child.tail)
+        
+        # If text is still empty or contains HTML entities, try alternative method
+        if not text.strip() or '&' in text:
+            # Convert the element to string including all its content
+            full_xml = ET.tostring(p_elem, encoding='unicode', method='xml')
+            
+            # Replace <br/> tags with newlines
+            br_pattern = re.compile(r'<br\s*/>')
+            full_xml = br_pattern.sub('\n', full_xml)
+            
+            # Replace other br variants
+            full_xml = re.sub(r'<br[^>]*>', '\n', full_xml)
+            
+            # Remove all other XML tags
+            text = re.sub(r'<[^>]+>', '', full_xml).strip()
+            
+        # Handle HTML entities explicitly (both standard and numeric)
+        text = html.unescape(text)
+        
+        # Handle any remaining HTML entities that html.unescape might have missed
+        text = text.replace('&#039;', "'").replace('&quot;', '"')
+        
+        # Replace the replacement character with original character if possible
+        # but don't remove any characters - we want to keep all of them
+        text = text.replace('\xa0', ' ')  # Only replace non-breaking space with regular space
+        
+        # Remove excess whitespace but preserve linebreaks
+        text = '\n'.join(line.strip() for line in text.split('\n'))
+        
+        return text
+    
+    except Exception as e:
+        print(f"Error extracting text: {e}")
+        
+        # Fallback attempt if the above methods fail
+        try:
+            # Get raw text content and normalize
+            raw_text = p_elem.text or ""
+            for child in p_elem:
+                if child.tail:
+                    raw_text += child.tail
+            
+            return normalize_unicode(html.unescape(raw_text)).strip()
+        except:
+            return "[Text extraction failed]"
+
+def convert_dfxp_to_xlsx(dfxp_file, xlsx_file, frame_rate=25):
+    """Convert a DFXP file to XLSX format."""
+    try:
+        # Try different encoding options if UTF-8 fails
+        tree = None
+        encodings = ['utf-8', 'latin-1', 'utf-16', 'cp1252']
+        
+        for encoding in encodings:
+            try:
+                parser = ET.XMLParser(encoding=encoding)
+                tree = ET.parse(dfxp_file, parser=parser)
+                print(f"Successfully parsed file using {encoding} encoding")
+                break
+            except Exception as e:
+                print(f"Failed to parse with {encoding}: {e}")
+                continue
+        
+        if tree is None:
+            print("Failed to parse XML file with any encoding")
+            return False
+            
+        root = tree.getroot()
+        
+        # Define namespaces
+        namespaces = {
+            'tt': 'http://www.w3.org/ns/ttml',
+            'tts': 'http://www.w3.org/ns/ttml#styling',
+            'ttp': 'http://www.w3.org/ns/ttml#parameter',
+            'xml': 'http://www.w3.org/XML/1998/namespace'
+        }
+        
+        # Find all p elements - try different approaches
+        p_elems = []
+        
+        # Try with namespaces first
+        try:
+            p_elems = root.findall('.//tt:div/tt:p', namespaces)
+        except:
+            pass
+            
+        # If no elements found, try without namespaces
+        if not p_elems:
+            try:
+                p_elems = root.findall('.//div/p')
+            except:
+                pass
+        
+        # If still no elements, try broader approaches
+        if not p_elems:
+            try:
+                p_elems = root.findall('.//tt:p', namespaces)
+            except:
+                pass
+                
+        if not p_elems:
+            try:
+                p_elems = root.findall('.//p')
+            except:
+                pass
+        
+        if not p_elems:
+            print(f"No subtitle elements found in {dfxp_file}")
+            return False
+            
+        print(f"Found {len(p_elems)} subtitle elements in {dfxp_file}")
+        
+        # Extract subtitle entries
+        subtitle_entries = []
+        for i, elem in enumerate(p_elems, 1):
+            # Get attributes with fallbacks
+            begin = elem.get('begin')
+            end = elem.get('end')
+            subtitle_id = elem.get('id', f"subtitle{i}")
+            region = elem.get('region', 'default')
+            
+            # If xml:id is used instead of id
+            if not subtitle_id or subtitle_id == f"subtitle{i}":
+                xml_id = elem.get('{http://www.w3.org/XML/1998/namespace}id')
+                if xml_id:
+                    subtitle_id = xml_id
+            
+            if begin is not None:
+                begin_time = parse_time(begin, frame_rate)
+                end_time = parse_time(end, frame_rate) if end is not None else begin_time
+                
+                # Extract text, handling BR tags and encoding issues
+                text = extract_text_from_p_element(elem)
+                
+                subtitle_entries.append({
+                    'id': subtitle_id,
+                    'begin': begin_time,
+                    'end': end_time,
+                    'region': region,
+                    'original': text,
+                    'translation': ''  # Empty translation column
+                })
+        
+        # Sort by begin time (try to sort keeping original format)
+        subtitle_entries.sort(key=lambda x: str(x['begin']))
+        
+        # Create Excel workbook
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Subtitles"
+        
+        # Add header row
+        headers = ['ID', 'Begin', 'End', 'Region', 'Original', 'Translation']
+        for col_num, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_num)
+            cell.value = header
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # Add subtitle data
+        for row_num, entry in enumerate(subtitle_entries, 2):
+            ws.cell(row=row_num, column=1).value = entry['id']
+            ws.cell(row=row_num, column=2).value = entry['begin']
+            ws.cell(row=row_num, column=3).value = entry['end']
+            ws.cell(row=row_num, column=4).value = entry['region']
+            ws.cell(row=row_num, column=5).value = entry['original']
+            ws.cell(row=row_num, column=6).value = entry['translation']
+        
+        # Format columns
+        for col_num in range(1, len(headers) + 1):
+            column_letter = get_column_letter(col_num)
+            # Text columns (original and translation) get more width
+            if col_num in [5, 6]:
+                ws.column_dimensions[column_letter].width = 40
+            else:
+                ws.column_dimensions[column_letter].width = 15
+                
+            # Set alignment for all cells
+            for row_num in range(2, len(subtitle_entries) + 2):
+                cell = ws.cell(row=row_num, column=col_num)
+                # Align text columns differently
+                if col_num in [5, 6]:
+                    cell.alignment = Alignment(wrap_text=True, vertical='top')
+                else:
+                    cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # Save the workbook
+        wb.save(xlsx_file)
+        print(f"Successfully converted {len(subtitle_entries)} subtitles to {xlsx_file}")
+        return True
+    
+    except Exception as e:
+        print(f"Error converting {dfxp_file} to XLSX: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description='Convert DFXP subtitle files to XLSX format')
+    parser.add_argument('--input', '-i', required=True, help='Input DFXP file')
+    parser.add_argument('--output', '-o', help='Output XLSX file (default: same name with .xlsx extension)')
+    parser.add_argument('--framerate', '-r', type=float, default=25, help='Frame rate for frame-based timing (default: 25)')
+    
+    args = parser.parse_args()
+    
+    input_file = args.input
+    if not os.path.exists(input_file):
+        print(f"Error: Input file not found: {input_file}")
+        return
+    
+    output_file = args.output
+    if not output_file:
+        output_file = os.path.splitext(input_file)[0] + '.xlsx'
+    
+    print(f"Converting {input_file} to {output_file}...")
+    print(f"Using frame rate: {args.framerate} fps")
+    
+    success = convert_dfxp_to_xlsx(input_file, output_file, args.framerate)
+    
+    if success:
+        print(f"Conversion completed successfully.")
+    else:
+        print("Conversion failed.")
+
+if __name__ == "__main__":
+    main()

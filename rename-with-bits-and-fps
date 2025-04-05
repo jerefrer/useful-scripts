@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import json
+from pathlib import Path
+from rich.console import Console
+from rich.progress import Progress, BarColumn, TextColumn
+from rich.panel import Panel
+from rich.live import Live
+from rich import box
+
+class VideoRenamer:
+    def __init__(self, base_dir):
+        self.base_dir = Path(os.path.expanduser(base_dir)).resolve()
+        self.console = Console()
+
+    def check_video_properties(self, file_path):
+        try:
+            result = subprocess.run([
+                'ffprobe',
+                '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=codec_name,pix_fmt,r_frame_rate,bit_rate',
+                '-of', 'json',
+                str(file_path)
+            ], capture_output=True, text=True, check=True)
+            
+            data = json.loads(result.stdout)
+            if 'streams' in data and data['streams']:
+                stream = data['streams'][0]
+                pix_fmt = stream.get('pix_fmt', '')
+                
+                bit10_formats = [
+                    'yuv420p10le', 'yuv422p10le', 'yuv444p10le',
+                    'p010le', 'x2rgb10le', 'gray10le',
+                    'gbrp10le', 'gbrap10le'
+                ]
+                
+                is_10bit = (
+                    any(fmt in pix_fmt for fmt in bit10_formats) or
+                    (stream.get('bits_per_raw_sample') and int(stream.get('bits_per_raw_sample')) > 8)
+                )
+
+                frame_rate = stream.get('r_frame_rate', '25/1')
+                num, den = map(float, frame_rate.split('/'))
+                fps = num / den if den != 0 else 25
+                
+                return {
+                    'is_10bit': is_10bit,
+                    'fps': fps
+                }
+                
+            return {'is_10bit': False, 'fps': 25}
+        except Exception as e:
+            self.console.print(f"[yellow]Warning: Could not determine video properties for {file_path}: {e}")
+            return {'is_10bit': False, 'fps': 25}
+
+    def get_descriptive_name(self, input_file, video_info):
+        """Create a descriptive name for the file based on its properties"""
+        stem = input_file.stem
+        suffix = input_file.suffix
+        
+        # Build descriptor
+        descriptors = []
+        if video_info['is_10bit']:
+            descriptors.append("10bit")
+        else:
+            descriptors.append("8bit")
+            
+        if video_info['fps'] > 25:
+            descriptors.append("50fps")
+        else:
+            descriptors.append("25fps")
+        
+        # Create new name
+        descriptor_str = "_".join(descriptors)
+        return input_file.parent / f"{stem}_{descriptor_str}{suffix}"
+
+    def rename_file(self, input_file, video_info):
+        """Rename the file with descriptive properties unless it already has format info"""
+        # Check if file already has format info
+        if any(suffix in input_file.stem for suffix in ['_10bit', '_8bit', '_50fps', '_25fps']):
+            self.console.print(f"[yellow]Skipping {input_file.name} - already has format info")
+            return False
+            
+        new_name = self.get_descriptive_name(input_file, video_info)
+        if not new_name.exists():
+            input_file.rename(new_name)
+            self.console.print(f"[green]Renamed: {input_file.name} -> {new_name.name}")
+            return True
+        else:
+            self.console.print(f"[yellow]Skipping {input_file.name} - target name already exists")
+            return False
+
+    def find_video_files(self):
+        video_files = []
+        for root, _, files in os.walk(self.base_dir):
+            for filename in files:
+                if filename.startswith('._'):  # Skip macOS metadata files
+                    continue
+                    
+                if filename.lower().endswith(('.mp4', '.mov')):
+                    full_path = Path(root) / filename
+                    video_info = self.check_video_properties(full_path)
+                    video_files.append((full_path, video_info))
+        return sorted(video_files, key=lambda x: str(x[0]))
+
+    def process_directory(self):
+        with Live(Panel("Scanning for video files...", title="Video Renamer", border_style="blue"), console=self.console) as live:
+            files_to_process = self.find_video_files()
+            
+            if not files_to_process:
+                live.update(Panel("[yellow]No video files found!", title="Video Renamer", border_style="yellow"))
+                return True
+
+            # Show summary
+            summary = f"[bold blue]Found {len(files_to_process)} video files[/bold blue]"
+            live.update(Panel(summary, border_style="blue"))
+
+            renamed_count = 0
+            skipped_count = 0
+
+            # Process each file
+            for file, video_info in files_to_process:
+                if self.rename_file(file, video_info):
+                    renamed_count += 1
+                else:
+                    skipped_count += 1
+
+            # Show final summary
+            final_summary = [
+                f"[bold blue]Processing complete:[/bold blue]",
+                f"• [green]{renamed_count}[/green] files renamed",
+                f"• [yellow]{skipped_count}[/yellow] files skipped"
+            ]
+            live.update(Panel("\n".join(final_summary), border_style="green"))
+
+        return True
+
+def main():
+    if len(sys.argv) != 2:
+        console = Console()
+        console.print(Panel(
+            "[bold red]Error:[/bold red] Missing input directory\n\n"
+            f"Usage: {sys.argv[0]} <directory>",
+            title="Video Renamer",
+            border_style="red"
+        ))
+        sys.exit(1)
+        
+    input_dir = sys.argv[1]
+    
+    if not os.path.isdir(input_dir):
+        console = Console()
+        console.print(f"[bold red]Error:[/bold red] {input_dir} is not a directory")
+        sys.exit(1)
+        
+    renamer = VideoRenamer(input_dir)
+    success = renamer.process_directory()
+    sys.exit(0 if success else 1)
+
+if __name__ == '__main__':
+    main()

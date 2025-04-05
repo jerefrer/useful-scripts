@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+
+import re
+import os
+import time
+import random
+import sys
+import argparse
+from typing import List, Dict
+from datetime import datetime
+from dataclasses import dataclass
+from pathlib import Path
+from anthropic import Anthropic
+from anthropic.types import MessageParam
+from anthropic._exceptions import APIError
+import dotenv
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn
+
+# Constants for retry logic
+INITIAL_RETRY_DELAY = 2  # seconds
+MAX_RETRIES = 5
+MAX_RETRY_DELAY = 32    # seconds
+
+console = Console()
+
+@dataclass
+class SubtitleBlock:
+    number: int
+    timestamp: str
+    text: str
+    original_formatting: str
+    sentence_group: int = 0
+
+class ClaudeSRTTranslator:
+    def __init__(self, api_key: str):
+        """Initialize the translator with your Anthropic API key."""
+        self.client = Anthropic(api_key=api_key)
+        
+    def parse_srt(self, file_path: str) -> List[SubtitleBlock]:
+        """Parse an SRT file into a list of SubtitleBlock objects."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                content = file.read()
+        except UnicodeDecodeError:
+            # Try with different encodings if UTF-8 fails
+            encodings = ['iso-8859-1', 'cp1252', 'latin1']
+            for encoding in encodings:
+                try:
+                    with open(file_path, 'r', encoding=encoding) as file:
+                        content = file.read()
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                raise ValueError(f"Unable to read file with supported encodings: {encodings}")
+            
+        subtitle_blocks = re.split(r'\n\n+', content.strip())
+        parsed_subtitles = []
+        
+        for block in subtitle_blocks:
+            lines = block.strip().split('\n')
+            if len(lines) >= 3:
+                try:
+                    subtitle_number = int(lines[0])
+                    timestamp = lines[1]
+                    text = ' '.join(lines[2:])
+                    parsed_subtitles.append(SubtitleBlock(
+                        number=subtitle_number,
+                        timestamp=timestamp,
+                        text=text,
+                        original_formatting=block
+                    ))
+                except ValueError as e:
+                    console.print(f"[yellow]Warning: Skipping malformed subtitle block: {block}[/yellow]")
+                    continue
+        
+        # Group related sentences
+        sentence_group = 0
+        for i, subtitle in enumerate(parsed_subtitles):
+            text = subtitle.text.strip()
+            
+            if i > 0:
+                prev_text = parsed_subtitles[i-1].text.strip()
+                if prev_text and prev_text[-1] in '.!?':
+                    sentence_group += 1
+            
+            if re.match(r'^\[.*\]|\(.*\)$', text):
+                sentence_group += 1
+            
+            subtitle.sentence_group = sentence_group
+            
+            if text and text[-1] in '.!?':
+                sentence_group += 1
+        
+        return parsed_subtitles
+
+    def group_subtitles(self, subtitles: List[SubtitleBlock]) -> Dict[int, List[SubtitleBlock]]:
+        """Group subtitles by their sentence group."""
+        groups = {}
+        for subtitle in subtitles:
+            if subtitle.sentence_group not in groups:
+                groups[subtitle.sentence_group] = []
+            groups[subtitle.sentence_group].append(subtitle)
+        return groups
+
+    def translate_group(self, subtitle_group: List[SubtitleBlock], target_language: str) -> List[str]:
+        """Translate a group of subtitles with retries and error handling."""
+        combined_text = ' || '.join(sub.text for sub in subtitle_group)
+        
+        prompt = f"""Please translate the following subtitle text to {target_language}.
+        The text segments are separated by ' || ' which represent subtitle breaks.
+        Maintain these breaks in your translation and preserve any special formatting.
+        Keep speaker labels like [Name:] or sound effects (whispers) in their original form.
+        
+        Original text:
+        {combined_text}
+        
+        Guidelines:
+        1. Preserve the natural flow of speech across subtitle breaks
+        2. Maintain timing-appropriate length for each subtitle segment
+        3. Keep original styling (italics, brackets, parentheses)
+        4. Consider context across all segments when translating
+        """
+        
+        retry_count = 0
+        retry_delay = INITIAL_RETRY_DELAY
+        
+        while True:
+            try:
+                messages: List[MessageParam] = [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+                
+                response = self.client.messages.create(
+                    model="claude-3-opus-20240229",
+                    max_tokens=1000,
+                    temperature=0.3,
+                    system="You are a professional subtitle translator focusing on natural, context-aware translations while preserving formatting and timing constraints.",
+                    messages=messages
+                )
+                
+                # Add a small delay between successful requests to avoid rate limits
+                time.sleep(0.5)
+                
+                translated_segments = response.content[0].text.strip().split(' || ')
+                
+                if len(translated_segments) != len(subtitle_group):
+                    console.print(f"[yellow]Warning: Translation returned {len(translated_segments)} segments, expected {len(subtitle_group)}. Adjusting...[/yellow]")
+                    # Pad or truncate to match original length
+                    if len(translated_segments) < len(subtitle_group):
+                        translated_segments.extend([sub.text for sub in subtitle_group[len(translated_segments):]])
+                    else:
+                        translated_segments = translated_segments[:len(subtitle_group)]
+                
+                return translated_segments
+                
+            except APIError as e:
+                if 'overloaded' in str(e).lower() or getattr(e, 'status_code', None) == 529:
+                    retry_count += 1
+                    if retry_count > MAX_RETRIES:
+                        raise Exception(f"Max retries ({MAX_RETRIES}) exceeded. Last error: {e}")
+                        
+                    console.print(f"[yellow]API overloaded. Retrying in {retry_delay} seconds... (Attempt {retry_count}/{MAX_RETRIES})[/yellow]")
+                    time.sleep(retry_delay)
+                    # Exponential backoff with jitter
+                    retry_delay = min(retry_delay * 2 * (1 + random.random() * 0.1), MAX_RETRY_DELAY)
+                    continue
+                else:
+                    raise
+            except Exception as e:
+                console.print(f"[red]Error translating group: {e}[/red]")
+                return [sub.text for sub in subtitle_group]
+    
+    def translate_srt_file(self, input_path: str, target_language: str, output_dir: str = None) -> str:
+        """Translate an entire SRT file to the target language."""
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console
+        ) as progress:
+            progress.add_task("Parsing subtitles...", total=None)
+            parsed_subtitles = self.parse_srt(input_path)
+            grouped_subtitles = self.group_subtitles(parsed_subtitles)
+            
+            file_name = os.path.splitext(os.path.basename(input_path))[0]
+            output_filename = f"{file_name}.{target_language.lower}.srt"
+            
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                output_path = os.path.join(output_dir, output_filename)
+            else:
+                output_path = output_filename
+            
+            # Process groups
+            translated_blocks = []
+            translation_task = progress.add_task(
+                f"Translating to {target_language}...",
+                total=len(grouped_subtitles)
+            )
+            
+            for group_id in sorted(grouped_subtitles.keys()):
+                group = grouped_subtitles[group_id]
+                translated_segments = self.translate_group(group, target_language)
+                
+                for subtitle, translated_text in zip(group, translated_segments):
+                    translated_block = subtitle.original_formatting.replace(
+                        subtitle.text,
+                        translated_text.strip()
+                    )
+                    translated_blocks.append(translated_block)
+                
+                progress.update(translation_task, advance=1)
+            
+            # Write output file
+            progress.add_task("Saving translated file...", total=None)
+            with open(output_path, 'w', encoding='utf-8') as file:
+                file.write('\n\n'.join(translated_blocks) + '\n')
+            
+        return output_path
+
+def get_api_key() -> str:
+    """Get API key from .env file or environment variable."""
+    # Try loading from .env file first
+    env_path = Path('.env')
+    if env_path.exists():
+        dotenv.load_dotenv()
+    
+    api_key = os.getenv('ANTHROPIC_API_KEY')
+    if not api_key:
+        raise ValueError(
+            "ANTHROPIC_API_KEY not found. Please set it in your environment "
+            "variables or create a .env file with ANTHROPIC_API_KEY=your_key"
+        )
+    return api_key
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Translate SRT subtitle files using Claude AI',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Example usage:
+  %(prog)s input.srt --language Spanish
+  %(prog)s input.srt -l French -o ./translated/
+        """
+    )
+    parser.add_argument(
+        'input_file',
+        type=str,
+        help='Path to the input .srt file'
+    )
+    parser.add_argument(
+        '-l', '--language',
+        type=str,
+        default='French',
+        help='Target language for translation (default: French)'
+    )
+    parser.add_argument(
+        '-o', '--output-dir',
+        type=str,
+        help='Output directory for translated file (optional)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Validate input file
+    if not os.path.exists(args.input_file):
+        console.print(f"[red]Error: Input file '{args.input_file}' not found[/red]")
+        sys.exit(1)
+    
+    if not args.input_file.lower().endswith('.srt'):
+        console.print(f"[yellow]Warning: Input file '{args.input_file}' doesn't have .srt extension[/yellow]")
+    
+    try:
+        api_key = get_api_key()
+        translator = ClaudeSRTTranslator(api_key)
+        
+        translated_file = translator.translate_srt_file(
+            args.input_file,
+            args.language,
+            args.output_dir
+        )
+        
+        console.print(f"[green]Translation completed successfully![/green]")
+        console.print(f"Output saved to: [blue]{translated_file}[/blue]")
+        
+    except Exception as e:
+        console.print(f"[red]Error: {str(e)}[/red]")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

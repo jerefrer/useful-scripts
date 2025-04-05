@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+from pathlib import Path
+
+def is_10bit(file_path):
+    cmd = [
+        'ffprobe',
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_entries', 'stream=codec_name,profile,pix_fmt,bits_per_raw_sample,bit_depth',
+        '-of', 'default=noprint_wrappers=1',
+        str(file_path)
+    ]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        output = result.stdout.lower()
+        
+        # Various ways 10-bit might be indicated
+        ten_bit_indicators = [
+            'p10', 
+            'p10le', 
+            '10le',
+            'yuv420p10',
+            'yuv422p10',
+            'yuv444p10',
+            'bits_per_raw_sample=10',
+            'bit_depth=10',
+            'hevc main 10',
+            'main 10',
+            'main10'
+        ]
+        
+        if any(indicator in output for indicator in ten_bit_indicators):
+            return True
+            
+        return False
+        
+    except Exception as e:
+        print(f"Error analyzing {file_path}: {e}")
+        return False
+
+def is_macos_hidden(file_path):
+    return file_path.name.startswith('._') or file_path.name.startswith('.')
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: ./script.py <folder_path>")
+        sys.exit(1)
+    
+    folder_path = Path(sys.argv[1])
+    
+    if not folder_path.exists() or not folder_path.is_dir():
+        print(f"Error: {folder_path} is not a valid directory")
+        sys.exit(1)
+    
+    # Find all video files
+    video_files = []
+    for extension in ['.mp4', '.MP4', '.mov', '.MOV', '.mxf', '.MXF']:  # Added MXF format
+        video_files.extend([f for f in folder_path.rglob(f"*{extension}") 
+                          if not is_macos_hidden(f)])
+    
+    video_files = list(set(video_files))
+    video_files.sort()
+
+    if not video_files:
+        print(f"No video files found in {folder_path}")
+        sys.exit(0)
+    
+    print(f"Found {len(video_files)} video files. Analyzing for 10-bit content...")
+    found_10bit = False
+    
+    for file in video_files:
+        if is_10bit(file):
+            print(f"Found 10-bit: {file}")
+            found_10bit = True
+    
+    if not found_10bit:
+        print("\nNo 10-bit videos found")
+
+if __name__ == "__main__":
+    main()

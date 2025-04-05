@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+
+# PDF Metadata Editor
+# A script to modify PDF metadata including creator, producer, and creation date
+
+from PyPDF2 import PdfReader, PdfWriter
+from datetime import datetime
+import argparse
+import sys
+
+def modify_pdf_metadata(input_path, output_path, creator=None, producer=None, creation_date=None, title=None):
+    try:
+        # Open the PDF file
+        reader = PdfReader(input_path)
+        writer = PdfWriter()
+
+        # Copy pages from reader to writer
+        for page in reader.pages:
+            writer.add_page(page)
+
+        # Create metadata dictionary
+        metadata = reader.metadata.copy()
+
+        # Update metadata with new values if provided
+        if creator:
+            metadata['/Creator'] = creator
+        if producer:
+            metadata['/Producer'] = producer
+        if creation_date:
+            # Format date as PDF date string: D:YYYYMMDDHHmmSS
+            if isinstance(creation_date, datetime):
+                date_str = creation_date.strftime("D:%Y%m%d%H%M%S")
+            else:
+                date_str = creation_date
+            metadata['/CreationDate'] = date_str
+        if title:
+            metadata['/Title'] = title
+
+        # Add modified metadata to writer
+        writer.add_metadata(metadata)
+
+        # Write the modified PDF to a new file
+        with open(output_path, 'wb') as output_file:
+            writer.write(output_file)
+            
+        print(f"Successfully modified PDF metadata. New file saved as: {output_path}")
+        
+    except Exception as e:
+        print(f"Error: {str(e)}", file=sys.stderr)
+        sys.exit(1)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Modify PDF metadata (Title, Creator, Producer, and Creation Date)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  pdf-edit-metadata input.pdf output.pdf --creator "John Doe" --producer "Custom Software"
+  pdf-edit-metadata input.pdf output.pdf --creation-date "2024-02-15 14:30:00"
+  pdf-edit-metadata input.pdf output.pdf --creator "John Doe" --now
+  pdf-edit-metadata input.pdf output.pdf --title "My Document"
+        """
+    )
+
+    parser.add_argument('input', help='Input PDF file path')
+    parser.add_argument('output', help='Output PDF file path')
+    parser.add_argument('--title', help='New PDF title')
+    parser.add_argument('--creator', help='New creator name')
+    parser.add_argument('--producer', help='New producer name')
+    parser.add_argument('--creation-date', help='New creation date (format: YYYY-MM-DD HH:MM:SS)')
+    parser.add_argument('--now', action='store_true', help='Use current date and time as creation date')
+
+    args = parser.parse_args()
+
+    # Validate that at least one modification option is provided
+    if not any([args.creator, args.producer, args.creation_date, args.now, args.title]):
+        parser.error("At least one of --creator, --producer, --creation-date, --now, or --title must be specified")
+
+    # Process creation date
+    creation_date = None
+    if args.now:
+        creation_date = datetime.now()
+    elif args.creation_date:
+        try:
+            creation_date = datetime.strptime(args.creation_date, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            parser.error("Invalid date format. Use YYYY-MM-DD HH:MM:SS")
+
+    # Show current metadata before modification
+    try:
+        reader = PdfReader(args.input)
+        print("\nCurrent metadata:")
+        for key, value in reader.metadata.items():
+            print(f"{key}: {value}")
+    except Exception as e:
+        print(f"Error reading current metadata: {str(e)}", file=sys.stderr)
+        sys.exit(1)
+
+    # Modify the PDF
+    modify_pdf_metadata(
+        args.input,
+        args.output,
+        creator=args.creator,
+        producer=args.producer,
+        creation_date=creation_date,
+        title=args.title
+    )
+
+    # Show new metadata after modification
+    try:
+        reader = PdfReader(args.output)
+        print("\nNew metadata:")
+        for key, value in reader.metadata.items():
+            print(f"{key}: {value}")
+    except Exception as e:
+        print(f"Error reading new metadata: {str(e)}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

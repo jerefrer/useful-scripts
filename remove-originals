@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+from rich.console import Console
+from rich.panel import Panel
+from rich.live import Live
+from rich import box
+
+class VideoCleaner:
+    def __init__(self, base_dir):
+        self.base_dir = Path(os.path.expanduser(base_dir)).resolve()
+        self.console = Console()
+
+    def normalize_filename(self, file_path):
+        """Strip encoding information from filename for comparison"""
+        stem = file_path.stem
+        # Remove all known encoding suffixes
+        for suffix in ['_10bit', '_8bit', '_50fps', '_25fps', '_AAC']:
+            stem = stem.replace(suffix, '')
+        return stem
+
+    def get_aac_counterpart(self, file_path):
+        """Get the expected AAC version path for a given file"""
+        stem = file_path.stem
+        if stem.upper().endswith('_AAC'):
+            return None  # This is already an AAC file
+        return file_path.parent / f"{stem}_AAC{file_path.suffix}"
+
+    def find_files_to_process(self):
+        """Find all video files and analyze their status"""
+        files_to_remove = []
+        missing_aac_pairs = []
+        
+        # First, scan for all video files and group by normalized name
+        filename_groups = {}
+        for root, _, files in os.walk(self.base_dir):
+            for filename in files:
+                if filename.startswith('._'):  # Skip macOS metadata files
+                    continue
+                
+                file_path = Path(root) / filename
+                if file_path.suffix.upper() in ('.MP4', '.MOV'):
+                    normalized_name = self.normalize_filename(file_path)
+                    folder = str(file_path.parent)  # Group by folder too
+                    key = (folder, normalized_name)
+                    if key not in filename_groups:
+                        filename_groups[key] = {'normal': [], 'aac': []}
+                    
+                    if file_path.stem.upper().endswith('_AAC'):
+                        filename_groups[key]['aac'].append(file_path)
+                    else:
+                        filename_groups[key]['normal'].append(file_path)
+        
+        # Analyze each group
+        for (folder, normalized_name), group in filename_groups.items():
+            for normal_file in group['normal']:
+                files_to_remove.append(normal_file)
+                if not group['aac']:  # No AAC version found for this normalized name
+                    missing_aac_pairs.append(normal_file)
+        
+        return sorted(files_to_remove), sorted(missing_aac_pairs)
+
+    def remove_files(self, files, dry_run=True):
+        """Remove the specified files"""
+        removed_count = 0
+        error_count = 0
+        total_size = 0
+
+        for file_path in files:
+            try:
+                size = file_path.stat().st_size
+                rel_path = file_path.relative_to(self.base_dir)
+                
+                if dry_run:
+                    self.console.print(f"[yellow]Would remove:[/yellow] {rel_path} ({size / (1024*1024*1024):.2f} GB)")
+                    removed_count += 1
+                    total_size += size
+                else:
+                    file_path.unlink()
+                    self.console.print(f"[red]Removed:[/red] {rel_path} ({size / (1024*1024*1024):.2f} GB)")
+                    removed_count += 1
+                    total_size += size
+            except Exception as e:
+                self.console.print(f"[bold red]Error removing {rel_path}: {str(e)}")
+                error_count += 1
+
+        return removed_count, error_count, total_size
+
+    def process_directory(self, dry_run=True):
+        with Live(Panel("Scanning for video files...", title="Video Cleaner", border_style="blue"), console=self.console) as live:
+            files_to_remove, missing_aac_pairs = self.find_files_to_process()
+            
+            if not files_to_remove:
+                live.update(Panel("[green]No non-AAC video files found!", title="Video Cleaner", border_style="green"))
+                return True
+
+            # First show warning about missing AAC pairs if any
+            if missing_aac_pairs:
+                # Print warnings directly instead of using live update
+                self.console.print("\n[bold red]⚠ WARNING: The following files don't have AAC versions:[/bold red]")
+                for file_path in missing_aac_pairs:
+                    rel_path = file_path.relative_to(self.base_dir)
+                    self.console.print(f"• [yellow]{rel_path}[/yellow]")
+                    expected_aac = self.get_aac_counterpart(file_path)
+                    if expected_aac:
+                        rel_expected = expected_aac.relative_to(self.base_dir)
+                        self.console.print(f"  Expected: [blue]{rel_expected}[/blue]")
+                self.console.print()
+                
+                if not dry_run:
+                    self.console.print("\nPress Enter to continue or Ctrl+C to abort...")
+                    try:
+                        input()
+                    except KeyboardInterrupt:
+                        self.console.print("\n[yellow]Operation aborted by user[/yellow]")
+                        return False
+
+            # Show what we found
+            summary = [
+                f"[bold blue]Found {len(files_to_remove)} non-AAC video files",
+                f"[yellow]{len(missing_aac_pairs)} files missing AAC versions[/yellow]"
+            ]
+            live.update(Panel("\n".join(summary), border_style="blue"))
+
+            # Remove files and track results
+            removed_count, error_count, total_size = self.remove_files(files_to_remove, dry_run)
+
+            # Show final summary
+            mode = "Dry run -" if dry_run else "Completed -"
+            final_summary = [
+                f"[bold blue]{mode}[/bold blue]",
+                f"• {'Would remove' if dry_run else 'Removed'} [red]{removed_count}[/red] files",
+                f"• Total size: [yellow]{total_size / (1024*1024*1024):.2f} GB[/yellow]",
+                f"• Files missing AAC versions: [yellow]{len(missing_aac_pairs)}[/yellow]"
+            ]
+            if error_count > 0:
+                final_summary.append(f"• [bold red]Errors: {error_count}[/bold red]")
+                
+            live.update(Panel("\n".join(final_summary), 
+                            border_style="yellow" if dry_run else "red"))
+
+        return error_count == 0
+
+def main():
+    console = Console()
+    
+    # Check if we have enough arguments
+    if len(sys.argv) < 2:
+        console.print(Panel(
+            "[bold red]Error:[/bold red] Missing arguments\n\n"
+            f"Usage:\n"
+            f"  {sys.argv[0]} <directory>         # Dry run\n"
+            f"  {sys.argv[0]} --force <directory> # Actually remove files",
+            title="Video Cleaner",
+            border_style="red"
+        ))
+        sys.exit(1)
+    
+    # Parse arguments
+    args = sys.argv[1:]
+    force_mode = False
+    
+    if args[0] == "--force":
+        force_mode = True
+        args = args[1:]  # Remove the --force flag
+        
+    if not args:
+        console.print("[bold red]Error:[/bold red] Missing directory path")
+        sys.exit(1)
+        
+    # Combine remaining arguments as they might be parts of a path with spaces
+    input_dir = " ".join(args)
+    
+    if not os.path.isdir(input_dir):
+        console = Console()
+        console.print(f"[bold red]Error:[/bold red] {input_dir} is not a directory")
+        sys.exit(1)
+    
+    cleaner = VideoCleaner(input_dir)
+    success = cleaner.process_directory(dry_run=not force_mode)
+    sys.exit(0 if success else 1)
+
+if __name__ == '__main__':
+    main()

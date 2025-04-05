@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+
+import psutil
+import time
+from datetime import datetime
+import csv
+import os
+
+def monitor_cpu(threshold=80, interval=1, log_file="cpu_usage_log.csv"):
+    """
+    Monitor CPU usage and log processes when usage exceeds threshold.
+    
+    Args:
+        threshold (int): CPU percentage threshold to trigger logging (default: 80)
+        interval (int): Time in seconds between checks (default: 1)
+        log_file (str): Path to the CSV log file (default: cpu_usage_log.csv)
+    """
+    
+    # Create/open log file with headers if it doesn't exist
+    if not os.path.exists(log_file):
+        with open(log_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Timestamp', 'Total CPU %', 'Process Name', 'PID', 'Process CPU %', 'Memory %'])
+    
+    print(f"CPU usage monitor started. Logging to {log_file}")
+    print(f"Monitoring for CPU usage above {threshold}%")
+    print("Press Ctrl+C to stop monitoring\n")
+    
+    try:
+        while True:
+            total_cpu = psutil.cpu_percent(interval)
+            
+            if total_cpu >= threshold:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                print(f"\nHigh CPU usage detected at {timestamp}: {total_cpu}%")
+                
+                # Get process information
+                processes = []
+                for proc in psutil.process_iter(['pid', 'name']):
+                    try:
+                        proc_info = proc.info
+                        # Get CPU and memory percentages separately with error handling
+                        try:
+                            cpu_percent = proc.cpu_percent()
+                            cpu_percent = 0.0 if cpu_percent is None else cpu_percent
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            cpu_percent = 0.0
+                            
+                        try:
+                            memory_percent = proc.memory_percent()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            memory_percent = 0.0
+                        
+                        if cpu_percent > 0:  # Only log active processes
+                            processes.append([
+                                timestamp,
+                                total_cpu,
+                                proc_info['name'],
+                                proc_info['pid'],
+                                cpu_percent,
+                                memory_percent
+                            ])
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                        continue
+                
+                # Sort processes by CPU usage and log top consumers
+                processes.sort(key=lambda x: x[4], reverse=True)
+                top_processes = processes[:10]  # Log top 10 CPU-consuming processes
+                
+                # Write to CSV
+                with open(log_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerows(top_processes)
+                
+                # Print current top processes
+                print("\nTop CPU-consuming processes:")
+                print(f"{'Process Name':<30} {'PID':<10} {'CPU %':<10} {'Memory %':<10}")
+                print("-" * 60)
+                for proc in top_processes:
+                    print(f"{proc[2]:<30} {proc[3]:<10} {proc[4]:<10.1f} {proc[5]:<10.1f}")
+                print("\nWaiting for next check...")
+            
+            time.sleep(interval)
+    
+    except KeyboardInterrupt:
+        print("\nMonitoring stopped by user")
+        print(f"Log file saved at: {os.path.abspath(log_file)}")
+
+if __name__ == "__main__":
+    # You can adjust these parameters as needed
+    monitor_cpu(threshold=80,  # Trigger logging when CPU usage exceeds 80%
+                interval=1,    # Check every 1 second
+                log_file="cpu_usage_log.csv")  # Save logs to this file

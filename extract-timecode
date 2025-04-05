@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+import sys
+import json
+import subprocess
+import re
+from pathlib import Path
+
+def decode_ltc(file_path):
+    """Decode LTC using FFmpeg's LTC decoder filter."""
+    try:
+        cmd = [
+            'ffmpeg',
+            '-i', str(file_path),
+            '-map', '0:3',              # Select LTC audio track
+            '-af', 'astats,aformat=sample_fmts=s32:channel_layouts=mono,lowpass=f=12000,aresample=48000,alimiter,volume=8,aformat=sample_fmts=s32,alimiter,ltc',  # LTC decoder filter chain
+            '-f', 'null',
+            '-'
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Look for LTC timecode in the output
+        timecode = None
+        for line in result.stderr.split('\n'):
+            if 'timecode=' in line:
+                match = re.search(r'timecode=([0-9:]+)', line)
+                if match:
+                    timecode = match.group(1)
+                    break
+        
+        return timecode
+        
+    except subprocess.CalledProcessError as e:
+        print(f"Error decoding LTC: {e}")
+        return None
+
+def embed_timecode(input_path, timecode):
+    """Embed timecode in output file metadata."""
+    output_path = input_path.parent / f"{input_path.stem}_TC{input_path.suffix}"
+    
+    try:
+        cmd = [
+            'ffmpeg',
+            '-i', str(input_path),
+            '-map', '0',            # Copy all streams
+            '-c', 'copy',           # Copy all codecs
+            '-metadata', f'timecode={timecode}',
+            '-y',                   # Overwrite output
+            str(output_path)
+        ]
+        
+        subprocess.run(cmd, capture_output=True, check=True)
+        print(f"\nTimecode embedded successfully in: {output_path}")
+        return True
+        
+    except subprocess.CalledProcessError as e:
+        print(f"Error embedding timecode: {e}")
+        return False
+
+def main():
+    if len(sys.argv) != 2:
+        print(f"Usage: {sys.argv[0]} <video_file>")
+        sys.exit(1)
+
+    file_path = Path(sys.argv[1])
+    if not file_path.exists():
+        print(f"Error: File {file_path} does not exist")
+        sys.exit(1)
+
+    print(f"\nProcessing file: {file_path}")
+    print("-" * (13 + len(str(file_path))))
+
+    print("\nDecoding LTC timecode...")
+    timecode = decode_ltc(file_path)
+    
+    if timecode:
+        print(f"Found timecode: {timecode}")
+        print("\nEmbedding timecode in output file...")
+        if embed_timecode(file_path, timecode):
+            print("Done!")
+    else:
+        print("No valid timecode found in LTC track")
+
+if __name__ == '__main__':
+    main()

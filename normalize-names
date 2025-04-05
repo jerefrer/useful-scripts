@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+from rich.console import Console
+from rich.panel import Panel
+from rich.live import Live
+from rich import box
+
+class FileNormalizer:
+    def __init__(self, base_dir):
+        self.base_dir = Path(os.path.expanduser(base_dir)).resolve()
+        self.console = Console()
+
+    def normalize_filename(self, file_path):
+        """Normalize filename to ensure it has _8bit_25fps_AAC suffix"""
+        stem = file_path.stem
+        suffix = file_path.suffix
+        
+        # Remove any existing encoding info
+        for info in ['_8bit', '_10bit', '_25fps', '_50fps']:
+            stem = stem.replace(info, '')
+            
+        # Ensure we keep the AAC suffix if it exists
+        has_aac = stem.upper().endswith('_AAC')
+        if has_aac:
+            stem = stem[:-4]  # Remove _AAC to add our normalized suffix
+            
+        # Add our normalized suffix
+        new_stem = f"{stem}_8bit_25fps"
+        if has_aac:
+            new_stem += "_AAC"
+            
+        return file_path.parent / f"{new_stem}{suffix}"
+
+    def find_video_files(self):
+        """Find all video files that need normalization"""
+        video_files = []
+        for root, _, files in os.walk(self.base_dir):
+            for filename in files:
+                if filename.startswith('._'):  # Skip macOS metadata files
+                    continue
+                    
+                file_path = Path(root) / filename
+                if file_path.suffix.upper() in ('.MP4', '.MOV'):
+                    # Only include files that don't have the correct format
+                    if '_8bit_25fps' not in file_path.stem:
+                        video_files.append(file_path)
+        
+        return sorted(video_files)
+
+    def rename_files(self, files, dry_run=True):
+        """Rename the files to normalized format"""
+        renamed_count = 0
+        error_count = 0
+
+        for file_path in files:
+            try:
+                new_path = self.normalize_filename(file_path)
+                rel_path = file_path.relative_to(self.base_dir)
+                rel_new_path = new_path.relative_to(self.base_dir)
+                
+                if dry_run:
+                    self.console.print(f"[yellow]Would rename:[/yellow] {rel_path} → {rel_new_path}")
+                    renamed_count += 1
+                else:
+                    if new_path.exists():
+                        self.console.print(f"[red]Skipping: {rel_path} - target name already exists[/red]")
+                        error_count += 1
+                        continue
+                        
+                    file_path.rename(new_path)
+                    self.console.print(f"[green]Renamed:[/green] {rel_path} → {rel_new_path}")
+                    renamed_count += 1
+            except Exception as e:
+                self.console.print(f"[bold red]Error processing {rel_path}: {str(e)}")
+                error_count += 1
+
+        return renamed_count, error_count
+
+    def process_directory(self, dry_run=True):
+        with Live(Panel("Scanning for video files...", title="File Normalizer", border_style="blue"), console=self.console) as live:
+            files_to_rename = self.find_video_files()
+            
+            if not files_to_rename:
+                live.update(Panel("[green]All files already have correct format!", title="File Normalizer", border_style="green"))
+                return True
+
+            # Show what we found
+            summary = f"[bold blue]Found {len(files_to_rename)} files to normalize"
+            live.update(Panel(summary, border_style="blue"))
+
+            # Rename files and track results
+            renamed_count, error_count = self.rename_files(files_to_rename, dry_run)
+
+            # Show final summary
+            mode = "Dry run -" if dry_run else "Completed -"
+            final_summary = [
+                f"[bold blue]{mode}[/bold blue]",
+                f"• {'Would rename' if dry_run else 'Renamed'} [green]{renamed_count}[/green] files"
+            ]
+            if error_count > 0:
+                final_summary.append(f"• [bold red]Errors: {error_count}[/bold red]")
+                
+            live.update(Panel("\n".join(final_summary), 
+                            border_style="yellow" if dry_run else "green"))
+
+        return error_count == 0
+
+def main():
+    console = Console()
+    
+    # Check if we have enough arguments
+    if len(sys.argv) < 2:
+        console.print(Panel(
+            "[bold red]Error:[/bold red] Missing arguments\n\n"
+            f"Usage:\n"
+            f"  {sys.argv[0]} <directory>         # Dry run\n"
+            f"  {sys.argv[0]} --force <directory> # Actually rename files",
+            title="File Normalizer",
+            border_style="red"
+        ))
+        sys.exit(1)
+    
+    # Parse arguments
+    args = sys.argv[1:]
+    force_mode = False
+    
+    if args[0] == "--force":
+        force_mode = True
+        args = args[1:]  # Remove the --force flag
+        
+    if not args:
+        console.print("[bold red]Error:[/bold red] Missing directory path")
+        sys.exit(1)
+        
+    # Combine remaining arguments as they might be parts of a path with spaces
+    input_dir = " ".join(args)
+    
+    if not os.path.isdir(input_dir):
+        console.print(f"[bold red]Error:[/bold red] {input_dir} is not a directory")
+        sys.exit(1)
+    
+    normalizer = FileNormalizer(input_dir)
+    success = normalizer.process_directory(dry_run=not force_mode)
+    sys.exit(0 if success else 1)
+
+if __name__ == '__main__':
+    main()

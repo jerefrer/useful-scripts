@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import json
+import time
+from pathlib import Path
+from rich.console import Console
+from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
+from rich.panel import Panel
+from rich.table import Table
+from rich.live import Live
+from rich import box
+
+class VideoConverter:
+    def __init__(self, base_dir):
+        self.base_dir = Path(os.path.expanduser(base_dir)).resolve()
+        self.progress_file = self.base_dir / '.conversion_progress.json'
+        self.conversion_state = self._load_progress()
+        self.files_to_process = []
+        self.console = Console()
+
+    def _load_progress(self):
+        if self.progress_file.exists():
+            try:
+                with open(self.progress_file) as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                return {'completed': [], 'in_progress': None}
+        return {'completed': [], 'in_progress': None}
+
+    def _save_progress(self):
+        with open(self.progress_file, 'w') as f:
+            json.dump(self.conversion_state, f)
+
+    def check_video_properties(self, file_path):
+        try:
+            result = subprocess.run([
+                'ffprobe',
+                '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=codec_name,pix_fmt,profile,bits_per_raw_sample,color_range,color_space',
+                '-of', 'json',
+                str(file_path)
+            ], capture_output=True, text=True, check=True)
+            
+            data = json.loads(result.stdout)
+            if 'streams' in data and data['streams']:
+                stream = data['streams'][0]
+                pix_fmt = stream.get('pix_fmt', '')
+                
+                bit10_formats = [
+                    'yuv420p10le', 'yuv422p10le', 'yuv444p10le',
+                    'p010le', 'x2rgb10le', 'gray10le',
+                    'gbrp10le', 'gbrap10le'
+                ]
+                
+                is_10bit = (
+                    any(fmt in pix_fmt for fmt in bit10_formats) or
+                    (stream.get('bits_per_raw_sample') and int(stream.get('bits_per_raw_sample')) > 8)
+                )
+                
+                return {
+                    'is_10bit': is_10bit,
+                    'pix_fmt': pix_fmt,
+                    'codec': stream.get('codec_name', 'unknown')
+                }
+                
+            return {'is_10bit': False, 'pix_fmt': None, 'codec': 'unknown'}
+        except Exception as e:
+            self.console.print(f"[yellow]Warning: Could not determine video properties for {file_path}: {e}")
+            return {'is_10bit': False, 'pix_fmt': None, 'codec': 'unknown'}
+            
+    def check_ffmpeg(self):
+        try:
+            subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+            self.console.print("[bold green]✓ FFmpeg found")
+            return True
+        except (subprocess.SubprocessError, FileNotFoundError):
+            self.console.print("[bold red]✗ Error: FFmpeg not found. Please install FFmpeg first.")
+            return False
+
+    def find_video_files(self):
+        video_files = []
+        for root, _, files in os.walk(self.base_dir):
+            for filename in files:
+                if filename.startswith('._'):  # Skip macOS metadata files
+                    continue
+                    
+                # Skip files already ending with _AAC (case insensitive)
+                if filename.upper().endswith('_AAC.MP4') or filename.upper().endswith('_AAC.MOV'):
+                    continue
+                    
+                # Process only .mp4 and .mov files (case insensitive)
+                if filename.lower().endswith(('.mp4', '.mov')):
+                    full_path = Path(root) / filename
+                    video_info = self.check_video_properties(full_path)
+                    video_files.append((full_path, video_info))
+        return sorted(video_files, key=lambda x: str(x[0]))
+
+    def get_output_path(self, input_file, is_10bit):
+        suffix = "_8bit_AAC" if is_10bit else "_AAC"
+        return input_file.parent / f"{input_file.stem}{suffix}{input_file.suffix}"
+
+    def get_partial_path(self, output_path):
+        return output_path.parent / f"{output_path.stem}.partial{output_path.suffix}"
+
+    def convert_file(self, input_file, video_info, task_id, progress):
+        input_path = Path(input_file).resolve()
+        tracking_key = str(input_path.relative_to(self.base_dir))
+        is_10bit = video_info['is_10bit']
+        
+        output_path = self.get_output_path(input_path, is_10bit)
+        partial_path = self.get_partial_path(output_path)
+        
+        if tracking_key in self.conversion_state['completed']:
+            return True
+            
+        if output_path.exists():
+            self.conversion_state['completed'].append(tracking_key)
+            self._save_progress()
+            return True
+            
+        self.conversion_state['in_progress'] = tracking_key
+        self._save_progress()
+        
+        try:
+            # Get video duration for progress tracking
+            probe_result = subprocess.run([
+                'ffprobe',
+                '-v', 'quiet',
+                '-print_format', 'json',
+                '-show_format',
+                '-show_streams',
+                str(input_path)
+            ], capture_output=True, text=True, check=True)
+            
+            probe_data = json.loads(probe_result.stdout)
+            duration = float(probe_data['format']['duration'])
+            
+            # Get audio stream count
+            audio_streams = [s for s in probe_data['streams'] if s['codec_type'] == 'audio']
+            
+            # Base FFmpeg command with input
+            ffmpeg_command = ['ffmpeg', '-i', str(input_path)]
+            
+            # Add video mapping
+            ffmpeg_command.extend(['-map', '0:v:0'])
+            
+            # Video encoding settings based on bit depth
+            if is_10bit:
+                # Full 10-bit to 8-bit conversion with high quality settings
+                ffmpeg_command.extend([
+                    '-c:v', 'libx264',
+                    '-preset', 'slow',
+                    '-crf', '16',  # High quality setting
+                    '-vf', 'zscale=t=linear:npl=100,format=gbrp,zscale=p=bt709:t=bt709:m=bt709:r=full,format=yuv420p',
+                    '-pix_fmt', 'yuv420p',
+                    '-profile:v', 'high',
+                    '-level', '4.1',
+                    '-x264-params', 'videoformat=undef:colorprim=bt709:transfer=bt709:colormatrix=bt709:range=full:colorrange=pc'
+                ])
+            else:
+                # Copy video stream for 8-bit sources
+                ffmpeg_command.extend(['-c:v', 'copy'])
+            
+            # Add audio streams with AAC encoding
+            for i in range(len(audio_streams)):
+                ffmpeg_command.extend(['-map', f'0:a:{i}'])
+            
+            # Add high-quality audio encoding settings
+            ffmpeg_command.extend([
+                '-c:a', 'aac',
+                '-b:a', '320k',  # Maximum AAC bitrate
+                '-ar', '48000',
+                '-aac_coder', 'twoloop',
+                '-profile:a', 'aac_low'
+            ])
+            
+            # Add output path
+            ffmpeg_command.extend(['-y', str(partial_path)])
+            
+            process = subprocess.Popen(
+                ffmpeg_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+            
+            start_time = time.time()
+            
+            while True:
+                output = process.stderr.readline()
+                
+                if output == '' and process.poll() is not None:
+                    break
+                    
+                if output and 'time=' in output:
+                    try:
+                        time_str = output.split('time=')[1].split()[0]
+                        current_time = sum(float(x) * 60 ** i for i, x in enumerate(reversed(time_str.split(':'))))
+                        progress_value = (current_time / duration) * 100
+                        current_size = partial_path.stat().st_size if partial_path.exists() else 0
+                        speed = current_size / (time.time() - start_time) / 1024 / 1024
+                        conversion_type = "10→8bit" if is_10bit else "AAC"
+                        progress.update(task_id, completed=progress_value, 
+                                      description=f"{input_path.name} ({conversion_type}) {speed:.1f}MB/s")
+                    except:
+                        pass
+            
+            if process.returncode == 0:
+                # Verify the output if it was a 10-bit conversion
+                if is_10bit:
+                    output_info = self.check_video_properties(partial_path)
+                    if output_info['is_10bit']:
+                        raise Exception("Failed to convert to 8-bit: Output is still 10-bit")
+                    
+                partial_path.rename(output_path)
+                self.conversion_state['completed'].append(tracking_key)
+                self.conversion_state['in_progress'] = None
+                self._save_progress()
+                return True
+            else:
+                raise subprocess.CalledProcessError(process.returncode, ffmpeg_command)
+            
+        except Exception as e:
+            if partial_path.exists():
+                partial_path.unlink()
+            self.conversion_state['in_progress'] = None
+            self._save_progress()
+            self.console.print(f"[red]Error processing {input_path.name}: {str(e)}")
+            return False
+
+    def process_directory(self):
+        if not self.check_ffmpeg():
+            return False
+
+        with Live(Panel("Scanning for video files...", title="Video Converter", border_style="blue"), console=self.console) as live:
+            self.files_to_process = self.find_video_files()
+            
+            if not self.files_to_process:
+                live.update(Panel("[yellow]No video files found!", title="Video Converter", border_style="yellow"))
+                return True
+
+            # Count 10-bit and 8-bit files
+            bit_10_count = sum(1 for _, info in self.files_to_process if info['is_10bit'])
+            bit_8_count = len(self.files_to_process) - bit_10_count
+
+            # Initialize progress displays
+            progress = Progress(
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(complete_style="green"),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TimeRemainingColumn(),
+                expand=True
+            )
+            
+            total_progress = Progress(
+                TextColumn("[bold cyan]Overall Progress"),
+                BarColumn(complete_style="blue"),
+                TextColumn("{task.completed}/{task.total}"),
+                TimeRemainingColumn(),
+                expand=True
+            )
+
+            # Create layout
+            layout = Table.grid(padding=(1, 0))
+            summary = f"[bold blue]Found {len(self.files_to_process)} files:[/bold blue]\n"
+            summary += f"• [yellow]{bit_10_count}[/yellow] 10-bit files to convert\n"
+            summary += f"• [green]{bit_8_count}[/green] 8-bit files (audio only)"
+            layout.add_row(Panel.fit(summary, box=box.DOUBLE))
+            layout.add_row(Panel(progress, box=box.ROUNDED))
+            layout.add_row(Panel(total_progress, box=box.ROUNDED))
+            live.update(layout)
+
+            total_task = total_progress.add_task("progress", total=len(self.files_to_process))
+            success = True
+
+            for file, video_info in self.files_to_process:
+                file_task = progress.add_task(
+                    str(file.name),
+                    total=100
+                )
+                
+                if not self.convert_file(file, video_info, file_task, progress):
+                    success = False
+                
+                progress.remove_task(file_task)
+                total_progress.advance(total_task)
+
+            if success:
+                layout.add_row(Panel("[bold green]✓ All files converted successfully!", border_style="green"))
+            else:
+                layout.add_row(Panel("[bold red]✗ Some files failed to convert!", border_style="red"))
+            live.update(layout)
+
+        return success
+
+def main():
+    if len(sys.argv) != 2:
+        console = Console()
+        console.print(Panel(
+            "[bold red]Error:[/bold red] Missing input directory\n\n"
+            f"Usage: {sys.argv[0]} <directory>",
+            title="Video Converter",
+            border_style="red"
+        ))
+        sys.exit(1)
+        
+    input_dir = sys.argv[1]
+    
+    if not os.path.isdir(input_dir):
+        console = Console()
+        console.print(f"[bold red]Error:[/bold red] {input_dir} is not a directory")
+        sys.exit(1)
+        
+    converter = VideoConverter(input_dir)
+    success = converter.process_directory()
+    sys.exit(0 if success else 1)
+
+if __name__ == '__main__':
+    main()

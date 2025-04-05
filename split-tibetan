@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import re
+from docx import Document
+from docx.shared import Pt
+from docx.enum.style import WD_STYLE_TYPE
+
+def create_tibetan_style(document):
+    # Create or get the Verse Tibetan style
+    try:
+        style = document.styles.add_style('Verse Tibetan', WD_STYLE_TYPE.PARAGRAPH)
+    except:
+        style = document.styles['Verse Tibetan']
+    
+    # Configure the style
+    font = style.font
+    font.name = 'TibetanChogyalUnicode-170221'
+    font.size = Pt(32)
+    
+    # Optional: set other style properties if needed
+    style.paragraph_format.space_after = Pt(12)
+    style.paragraph_format.space_before = Pt(12)
+    
+    return style
+
+def process_single_file(input_file):
+    """Process a single text file and convert it to DOCX format."""
+    try:
+        base_name = os.path.splitext(input_file)[0]
+        output_file = f"{base_name}_split.docx"
+        
+        # Read and process the content
+        with open(input_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Apply the text processing rules
+        content = re.sub(r'  (།[།]?)', r' \1\n', content)
+        content = re.sub(r'  ', '\n', content)
+        content = re.sub(r'^\s+', '', content, flags=re.MULTILINE)
+        content = re.sub(r'((ཧཱུྃ|ན་མོ|ཨོཾ|ཧོ|ཨཱ|ཧྲཱི)[།༔ཿ])\n([^\n]*)', r'\1 \3', content, flags=re.MULTILINE)
+        
+        # Create a new Word document
+        doc = Document()
+        
+        # Create the Tibetan style
+        tibetan_style = create_tibetan_style(doc)
+        
+        # Add each line as a paragraph with the Tibetan style
+        for line in content.split('\n'):
+            if line.strip():  # Only add non-empty lines
+                paragraph = doc.add_paragraph(line.strip())
+                paragraph.style = tibetan_style
+        
+        # Save the document
+        doc.save(output_file)
+            
+        print(f"Processed: {input_file} -> {output_file}")
+        return True
+        
+    except FileNotFoundError:
+        print(f"Error: Input file '{input_file}' not found.")
+        return False
+    except Exception as e:
+        print(f"Error processing {input_file}: {str(e)}")
+        return False
+
+def process_folder(folder_path):
+    """Process all text files in the given folder."""
+    if not os.path.exists(folder_path):
+        print(f"Error: Folder '{folder_path}' does not exist.")
+        return False
+
+    success = True
+    processed_files = 0
+    
+    # Process each file in the folder
+    for filename in os.listdir(folder_path):
+        source_file = os.path.join(folder_path, filename)
+        
+        # Skip if it's a directory or not a text file
+        if os.path.isdir(source_file) or not filename.lower().endswith(('.txt', '.TXT')):
+            continue
+
+        # Process the file
+        if process_single_file(source_file):
+            processed_files += 1
+        else:
+            success = False
+
+    if processed_files > 0:
+        print(f"\nProcessed {processed_files} file(s) in {folder_path}")
+    else:
+        print(f"\nNo text files found in {folder_path}")
+    
+    return success
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python script.py <file_or_folder_path>")
+        sys.exit(1)
+
+    path = sys.argv[1]
+    
+    if not os.path.exists(path):
+        print(f"Error: Path '{path}' does not exist.")
+        sys.exit(1)
+
+    if os.path.isfile(path):
+        # Process single file
+        success = process_single_file(path)
+    else:
+        # Process folder
+        success = process_folder(path)
+
+    sys.exit(0 if success else 1)
+
+if __name__ == "__main__":
+    main()

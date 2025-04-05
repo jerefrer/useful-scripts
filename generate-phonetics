@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import re
+import bophono
+from docx import Document
+from docx.shared import Pt
+from docx.enum.style import WD_STYLE_TYPE
+
+PHON_KVP = bophono.UnicodeToApi(schema="KVP", options = {})
+
+def create_phonetics_style(document):
+    """Create or get the Phonetics style with Calibri 11pt."""
+    try:
+        style = document.styles.add_style('Phonetics', WD_STYLE_TYPE.PARAGRAPH)
+    except:
+        style = document.styles['Phonetics']
+    
+    # Configure the style
+    font = style.font
+    font.name = 'Calibri'
+    font.size = Pt(11)
+    
+    return style
+
+def segment_by_two(in_str):
+    lines = in_str.split("\n")
+    res = ""
+    for l in lines:
+        countsyls = len(re.findall("[\u0F35\u0F37ཀ-\u0f7e\u0F80-\u0FBC]+", l))
+        l = re.sub(r"([\u0F35\u0F37ཀ-\u0f7e\u0F80-\u0FBC]+[^\u0F35\u0F37ཀ-\u0f7e\u0F80-\u0FBC]+[\u0F35\u0F37ཀ-\u0f7e\u0F80-\u0FBC]+[^\u0F35\u0F37ཀ-\u0f7e\u0F80-\u0FBC]*)", r"\1 ", l)
+        if countsyls % 2 == 1:
+            l = re.sub(r" ([\u0F35\u0F37ཀ-\u0f7e\u0F80-\u0FBC]+[^\u0F35\u0F37ཀ-\u0f7e\u0F80-\u0FBC]*)$", r"\1", l)
+        res += l+"\n"
+    return res
+
+def generate_phonetics(in_str):
+    lines = in_str.split("\n")
+    res = []  # Store lines in a list instead of a string
+    for l in lines:
+        if not l.strip():  # Preserve empty lines
+            res.append("")
+            continue
+        words = l.split()
+        line = ""
+        for word in words:
+            line += f'{PHON_KVP.get_api(word)}  '
+        res.append(line.strip())
+    return res
+
+def segment_by_two_and_generate_phonetics(in_str):
+    seg = segment_by_two(in_str)
+    return generate_phonetics(seg)
+
+def extract_text_from_docx(docx_path):
+    """Extract text from DOCX file, preserving paragraph breaks."""
+    doc = Document(docx_path)
+    text = ""
+    for paragraph in doc.paragraphs:
+        if paragraph.text.strip():
+            text += paragraph.text.strip() + "\n"
+        else:
+            text += "\n"  # Preserve empty paragraphs as line breaks
+    return text
+
+def read_text_file(file_path):
+    """Read text from a plain text file."""
+    with open(file_path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+def get_file_content(file_path):
+    """Get content from either a DOCX or TXT file."""
+    if file_path.lower().endswith('.docx'):
+        return extract_text_from_docx(file_path)
+    elif file_path.lower().endswith('.txt'):
+        return read_text_file(file_path)
+    else:
+        raise ValueError("Unsupported file format. Only .txt and .docx files are supported.")
+
+def create_phonetics_docx(phonetic_lines, output_file):
+    """Create a DOCX file with phonetic content using the Phonetics style."""
+    doc = Document()
+    
+    # Create the Phonetics style
+    phonetics_style = create_phonetics_style(doc)
+    
+    # Add each line as a paragraph with the Phonetics style
+    for line in phonetic_lines:
+        if line:  # If line has content
+            paragraph = doc.add_paragraph(line)
+            paragraph.style = phonetics_style
+        else:  # Empty line
+            doc.add_paragraph()
+    
+    # Save the document
+    doc.save(output_file)
+
+def process_single_file(file_path):
+    """Process a single file (DOCX or TXT) and generate its phonetic version."""
+    try:
+        if not (file_path.lower().endswith(('.docx', '.txt'))):
+            print(f"Skipping unsupported file: {file_path}")
+            return False
+
+        # Extract text from file
+        content = get_file_content(file_path)
+
+        # Generate phonetics
+        phonetic_lines = segment_by_two_and_generate_phonetics(content)
+
+        # Create output filename next to the original
+        base_name = os.path.splitext(file_path)[0]
+        output_file = f"{base_name}_phonetics.docx"
+
+        # Create the DOCX file with phonetic content
+        create_phonetics_docx(phonetic_lines, output_file)
+
+        print(f"Generated phonetics for: {os.path.basename(file_path)}")
+        return True
+
+    except Exception as e:
+        print(f"Error processing {file_path}: {str(e)}")
+        return False
+
+def process_folder(folder_path):
+    """Process all DOCX and TXT files in the given folder."""
+    if not os.path.exists(folder_path):
+        print(f"Error: Folder '{folder_path}' does not exist.")
+        return False
+
+    success = True
+    processed_files = 0
+
+    # Process each file in the folder
+    for filename in os.listdir(folder_path):
+        if not filename.lower().endswith(('.docx', '.txt')):
+            continue
+            
+        source_file = os.path.join(folder_path, filename)
+        
+        # Skip if it's a directory
+        if os.path.isdir(source_file):
+            continue
+
+        # Process the file
+        if process_single_file(source_file):
+            processed_files += 1
+        else:
+            success = False
+
+    if processed_files > 0:
+        print(f"\nProcessed {processed_files} file(s) in {folder_path}")
+    else:
+        print(f"\nNo supported files found in {folder_path}")
+
+    return success
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python script.py <file_or_folder_path>")
+        print("Supported file formats: .txt, .docx")
+        sys.exit(1)
+
+    path = sys.argv[1]
+    
+    if not os.path.exists(path):
+        print(f"Error: Path '{path}' does not exist.")
+        sys.exit(1)
+
+    if os.path.isfile(path):
+        # Process single file
+        success = process_single_file(path)
+    else:
+        # Process folder
+        success = process_folder(path)
+
+    sys.exit(0 if success else 1)
+
+if __name__ == "__main__":
+    main()

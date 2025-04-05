@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+
+import docx
+import sys
+import argparse
+from pathlib import Path
+
+def search_docs(folder_path, search_term, context_lines=0):
+    """
+    Search .docx files for a term and display matches with context.
+    
+    Args:
+        folder_path (str): Path to search for .docx files
+        search_term (str): Term to search for
+        context_lines (int): Number of lines of context to show around matches
+    """
+    found_matches = False
+    
+    for file in Path(folder_path).rglob('*.docx'):
+        # Skip temporary Word files
+        if file.name.startswith('~$'):
+            continue
+            
+        try:
+            doc = docx.Document(file)
+            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]  # Skip empty paragraphs
+            
+            # Find matches in the current document
+            matches_found = False
+            for i, text in enumerate(paragraphs):
+                if search_term.lower() in text.lower():
+                    if not matches_found:
+                        print(f"\n\033[1m{file}\033[0m")  # Bold filename
+                        matches_found = True
+                        found_matches = True
+                    
+                    # Calculate context range
+                    start = max(0, i - context_lines)
+                    end = min(len(paragraphs), i + context_lines + 1)
+                    
+                    # Print context before match
+                    if context_lines > 0:
+                        for j in range(start, i):
+                            print(f"  {j+1:4d} | {paragraphs[j]}")
+                    
+                    # Print matching line (highlighted)
+                    print(f"→ {i+1:4d} | {text}")
+                    
+                    # Print context after match
+                    if context_lines > 0:
+                        for j in range(i + 1, end):
+                            print(f"  {j+1:4d} | {paragraphs[j]}")
+                        print("-" * 80)
+                        
+        except Exception as e:
+            print(f"\033[91mError processing {file}: {str(e)}\033[0m", file=sys.stderr)
+            
+    if not found_matches:
+        print(f"No matches found for '{search_term}'")
+
+def main():
+    parser = argparse.ArgumentParser(description="Search .docx files for text with context")
+    parser.add_argument("folder_path", help="Folder path to search for .docx files")
+    parser.add_argument("search_term", help="Term to search for")
+    parser.add_argument("-c", "--context", type=int, default=0,
+                        help="Number of context lines to show before and after matches (default: 0)")
+    
+    args = parser.parse_args()
+    
+    try:
+        search_docs(args.folder_path, args.search_term, args.context)
+    except Exception as e:
+        print(f"\033[91mError: {str(e)}\033[0m", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

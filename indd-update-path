@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import shutil
+import zipfile
+import tempfile
+import subprocess
+import platform
+from pathlib import Path
+
+class InDesignProcessor:
+    def __init__(self):
+        # Set up InDesign paths based on OS
+        if platform.system() == 'Darwin':  # macOS
+            self.indesign_path = '/Applications/Adobe InDesign 2025/Adobe InDesign 2025.app/Contents/MacOS/Adobe InDesign 2025'
+        elif platform.system() == 'Windows':
+            program_files = os.environ.get('PROGRAMFILES', 'C:\\Program Files')
+            self.indesign_path = f'{program_files}\\Adobe\\Adobe InDesign 2025\\InDesign.exe'
+        else:
+            raise SystemError("Unsupported operating system")
+
+        # Find actual InDesign path
+        self.resolve_indesign_path()
+
+    def resolve_indesign_path(self):
+        """Find the actual InDesign executable path."""
+        import glob
+        paths = glob.glob(self.indesign_path)
+        if not paths:
+            raise FileNotFoundError("Could not find InDesign installation")
+        # Use the latest version if multiple are found
+        self.indesign_path = sorted(paths)[-1]
+
+    def create_script(self, indd_path, temp_idml_path, output_indd_path=None):
+        """Create a temporary ExtendScript file."""
+        if output_indd_path is None:
+            output_indd_path = indd_path.replace('.indd', '_updated.indd')
+        
+        script = f'''
+        try {{
+            var doc = app.open("{indd_path}");
+            doc.exportFile(ExportFormat.INDESIGN_MARKUP, File("{temp_idml_path}"));
+            doc.close(SaveOptions.NO);
+            
+            var newDoc = app.open(File("{temp_idml_path}"));
+            newDoc.save(File("{output_indd_path}"));
+            newDoc.close(SaveOptions.NO);
+            app.quit();
+        }} catch(e) {{
+            alert("Error: " + e);
+            app.quit();
+        }}
+        '''
+        
+        script_path = os.path.join(tempfile.gettempdir(), 'temp_script.jsx')
+        with open(script_path, 'w') as f:
+            f.write(script)
+        return script_path
+
+    def update_file_paths_in_idml(self, idml_path, old_path, new_path):
+        """Update file paths in IDML file."""
+        changes_count = 0
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Extract IDML
+            with zipfile.ZipFile(idml_path, 'r') as zip_ref:
+                zip_ref.extractall(temp_dir)
+            
+            # Process all XML files
+            for root, _, files in os.walk(temp_dir):
+                for file in files:
+                    if file.endswith('.xml'):
+                        file_path = os.path.join(root, file)
+                        
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        
+                        new_content = content.replace(old_path, new_path)
+                        if new_content != content:
+                            changes_count += new_content.count(new_path) - content.count(new_path)
+                            with open(file_path, 'w', encoding='utf-8') as f:
+                                f.write(new_content)
+            
+            # Create new IDML
+            with zipfile.ZipFile(idml_path, 'w', compression=zipfile.ZIP_DEFLATED) as zip_ref:
+                for root, _, files in os.walk(temp_dir):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        archive_path = os.path.relpath(file_path, temp_dir)
+                        zip_ref.write(file_path, archive_path)
+        
+        return changes_count
+
+    def process_indd(self, indd_path, old_path, new_path, output_path=None):
+        """Process an INDD file completely."""
+        try:
+            # Create temporary IDML path
+            temp_idml = os.path.join(tempfile.gettempdir(), 'temp.idml')
+            
+            # Create script
+            script_path = self.create_script(indd_path, temp_idml, output_path)
+            
+            # Run InDesign with script
+            cmd = [self.indesign_path, '-script', script_path]
+            subprocess.run(cmd, check=True)
+            
+            # Update paths in IDML
+            changes = self.update_file_paths_in_idml(temp_idml, old_path, new_path)
+            
+            # Open modified IDML with InDesign and save as INDD
+            cmd = [self.indesign_path, '-script', script_path]
+            subprocess.run(cmd, check=True)
+            
+            # Clean up
+            os.remove(temp_idml)
+            os.remove(script_path)
+            
+            return True, f"Successfully updated {changes} file paths"
+            
+        except Exception as e:
+            return False, f"Error: {str(e)}"
+
+def main():
+    """Command line interface."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Update file paths in InDesign files')
+    parser.add_argument('indd_file', help='Path to the INDD file')
+    parser.add_argument('old_path', help='Old file path to replace')
+    parser.add_argument('new_path', help='New file path to use')
+    parser.add_argument('--output', help='Output INDD file path (optional)')
+    
+    args = parser.parse_args()
+    
+    processor = InDesignProcessor()
+    success, message = processor.process_indd(
+        args.indd_file,
+        args.old_path,
+        args.new_path,
+        args.output
+    )
+    
+    print(message)
+    return 0 if success else 1
+
+if __name__ == '__main__':
+    sys.exit(main())

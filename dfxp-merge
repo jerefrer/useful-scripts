@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+
+import xml.etree.ElementTree as ET
+import argparse
+import os
+import copy
+import re
+
+def parse_time(time_str, frame_rate=25):
+    """
+    Parse DFXP/TTML time format to seconds.
+    Handles multiple formats including:
+    - HH:MM:SS:FF (frames)
+    - HH:MM:SS.ms (milliseconds)
+    - Ns (seconds with optional decimal)
+    """
+    # Handle seconds format (e.g., "1.038s")
+    if time_str.endswith('s'):
+        return float(time_str[:-1])
+    
+    # Handle frames format (HH:MM:SS:FF)
+    if ':' in time_str and len(time_str.split(':')) > 3:
+        h, m, s, f = time_str.split(':')
+        return int(h) * 3600 + int(m) * 60 + int(s) + int(f) / frame_rate
+    
+    # Handle standard time format (HH:MM:SS.ms)
+    if '.' in time_str:
+        main_part, ms_part = time_str.split('.')
+        parts = main_part.split(':')
+        if len(parts) == 3:  # HH:MM:SS.ms
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + int(s) + float('0.' + ms_part)
+        elif len(parts) == 2:  # MM:SS.ms
+            m, s = parts
+            return int(m) * 60 + int(s) + float('0.' + ms_part)
+    else:
+        parts = time_str.split(':')
+        if len(parts) == 3:  # HH:MM:SS
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + int(s)
+        elif len(parts) == 2:  # MM:SS
+            m, s = parts
+            return int(m) * 60 + int(s)
+    
+    # Default fallback
+    print(f"Warning: Couldn't parse time format: {time_str}")
+    return 0
+
+def format_time(seconds, format_type='frames', frame_rate=25):
+    """
+    Format seconds back to DFXP time format.
+    Supports multiple output formats based on the detected format_type.
+    """
+    if format_type == 'seconds':
+        return f"{seconds:.3f}s"
+    
+    # Default to frames format
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    frames = int((seconds % 1) * frame_rate)
+    
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}:{frames:02d}"
+
+def detect_time_format(dfxp_file):
+    """Detect the time format used in the DFXP file."""
+    try:
+        tree = ET.parse(dfxp_file)
+        root = tree.getroot()
+        
+        # First, check if there's an explicit frame rate
+        frame_rate = 25  # Default frame rate
+        for attr_name, attr_value in root.attrib.items():
+            if attr_name.endswith('frameRate'):
+                frame_rate = float(attr_value)
+                break
+        
+        # Define namespaces
+        namespaces = {
+            'tt': 'http://www.w3.org/ns/ttml',
+            'tts': 'http://www.w3.org/ns/ttml#styling',
+            'ttp': 'http://www.w3.org/ns/ttml#parameter'
+        }
+        
+        # Find all p elements with begin attribute
+        p_elements = []
+        try:
+            p_elements = root.findall('.//tt:p[@begin]', namespaces)
+        except:
+            try:
+                p_elements = root.findall('.//p[@begin]')
+            except:
+                pass
+        
+        format_type = 'frames'  # Default format
+        
+        if p_elements:
+            for elem in p_elements:
+                begin_value = elem.get('begin', '')
+                if begin_value:
+                    if begin_value.endswith('s'):
+                        format_type = 'seconds'
+                        break
+                    elif ':' in begin_value:
+                        format_type = 'frames'
+                        break
+        
+        return format_type, frame_rate
+    
+    except Exception as e:
+        print(f"Error detecting time format in {dfxp_file}: {e}")
+        return 'frames', 25
+
+def extract_subtitle_elements(dfxp_file, frame_rate=25):
+    """Extract subtitle elements from a DFXP file with timing information."""
+    try:
+        tree = ET.parse(dfxp_file)
+        root = tree.getroot()
+        
+        # Detect time format
+        format_type, detected_frame_rate = detect_time_format(dfxp_file)
+        if detected_frame_rate != 25:
+            frame_rate = detected_frame_rate
+            print(f"Detected frame rate: {frame_rate}")
+        
+        # Define namespaces
+        namespaces = {
+            'tt': 'http://www.w3.org/ns/ttml',
+            'tts': 'http://www.w3.org/ns/ttml#styling',
+            'ttp': 'http://www.w3.org/ns/ttml#parameter'
+        }
+        
+        # Find all p elements - use one approach only to avoid duplicates
+        subtitle_elements = []
+        p_elems = []
+        
+        # Try to find p elements with namespaces first
+        try:
+            p_elems = root.findall('.//tt:div/tt:p', namespaces)
+        except:
+            pass
+            
+        # If no elements found, try without namespaces
+        if not p_elems:
+            try:
+                p_elems = root.findall('.//div/p')
+            except:
+                pass
+        
+        # If still no elements, try broader approaches
+        if not p_elems:
+            try:
+                p_elems = root.findall('.//tt:p', namespaces)
+            except:
+                pass
+                
+        if not p_elems:
+            try:
+                p_elems = root.findall('.//p')
+            except:
+                pass
+        
+        if not p_elems:
+            print(f"No subtitle elements found in {dfxp_file}")
+            return []
+            
+        print(f"Found {len(p_elems)} subtitle elements in {dfxp_file}")
+        
+        # Process found elements
+        for elem in p_elems:
+            begin = elem.get('begin')
+            end = elem.get('end')
+            
+            if begin is not None:
+                begin_seconds = parse_time(begin, frame_rate)
+                end_seconds = parse_time(end, frame_rate) if end is not None else begin_seconds + 5
+                
+                # Create a copy to avoid modifying the original tree
+                elem_copy = copy.deepcopy(elem)
+                
+                # Add source file info for debugging
+                elem_copy.set('sourceFile', os.path.basename(dfxp_file))
+                
+                subtitle_elements.append({
+                    'element': elem_copy,
+                    'begin': begin_seconds,
+                    'end': end_seconds,
+                    'format_type': format_type,
+                    'frame_rate': frame_rate,
+                    'source_file': os.path.basename(dfxp_file)
+                })
+        
+        return subtitle_elements
+    
+    except Exception as e:
+        print(f"Error processing {dfxp_file}: {e}")
+        return []
+
+def create_merged_dfxp(subtitle_elements, output_file, template_file=None, preferred_format=None, frame_rate=25):
+    """Create a new DFXP file with merged subtitle elements."""
+    try:
+        # Use the first input file as a template, or a specified template file
+        if template_file and os.path.exists(template_file):
+            tree = ET.parse(template_file)
+            template_src = template_file
+        else:
+            # Find the source file of the first subtitle element
+            first_source = subtitle_elements[0]['source_file']
+            tree = ET.parse(first_source)
+            template_src = first_source
+        
+        root = tree.getroot()
+        
+        # Detect the time format used in the template
+        format_type, detected_frame_rate = detect_time_format(template_src)
+        
+        # Use preferred format if specified
+        if preferred_format:
+            format_type = preferred_format
+        
+        # Use detected frame rate
+        if detected_frame_rate != 25:
+            frame_rate = detected_frame_rate
+        
+        # Define namespaces
+        namespaces = {
+            'tt': 'http://www.w3.org/ns/ttml',
+            'tts': 'http://www.w3.org/ns/ttml#styling',
+            'ttp': 'http://www.w3.org/ns/ttml#parameter'
+        }
+        
+        # Find the body element
+        body = None
+        try:
+            body_elems = root.findall('.//tt:body', namespaces)
+            if body_elems:
+                body = body_elems[0]
+        except:
+            pass
+            
+        if not body:
+            try:
+                body_elems = root.findall('.//body')
+                if body_elems:
+                    body = body_elems[0]
+            except:
+                pass
+        
+        if not body:
+            print("Could not find body element in template, creating new one")
+            # Create a new body element with proper namespace
+            body = ET.SubElement(root, "{http://www.w3.org/ns/ttml}body")
+        
+        # Find or create div element
+        div = None
+        try:
+            div_elems = body.findall('.//tt:div', namespaces)
+            if div_elems:
+                div = div_elems[0]
+        except:
+            pass
+            
+        if not div:
+            try:
+                div_elems = body.findall('.//div')
+                if div_elems:
+                    div = div_elems[0]
+            except:
+                pass
+        
+        if not div:
+            # Create a new div with appropriate namespace
+            div = ET.SubElement(body, "{http://www.w3.org/ns/ttml}div")
+        
+        # Clear existing content in the div
+        for child in list(div):
+            div.remove(child)
+        
+        # Sort subtitle elements by begin time
+        sorted_elements = sorted(subtitle_elements, key=lambda x: x['begin'])
+        
+        # Add all subtitle elements to the div
+        for item in sorted_elements:
+            elem = item['element']
+            
+            # Format timing attributes according to the selected format
+            begin_formatted = format_time(item['begin'], format_type, frame_rate)
+            end_formatted = format_time(item['end'], format_type, frame_rate)
+            
+            # Update the timing attributes
+            elem.set('begin', begin_formatted)
+            elem.set('end', end_formatted)
+            
+            # Remove sourceFile attribute we added for tracking
+            if 'sourceFile' in elem.attrib:
+                del elem.attrib['sourceFile']
+            
+            div.append(elem)
+        
+        # Write the result to the output file
+        
+        # Ensure proper XML declaration
+        ET.register_namespace('', 'http://www.w3.org/ns/ttml')
+        ET.register_namespace('ttp', 'http://www.w3.org/ns/ttml#parameter')
+        ET.register_namespace('tts', 'http://www.w3.org/ns/ttml#styling')
+        ET.register_namespace('ttm', 'http://www.w3.org/ns/ttml#metadata')
+        
+        tree.write(output_file, encoding='utf-8', xml_declaration=True)
+        print(f"Successfully merged {len(sorted_elements)} subtitles to {output_file}")
+        return True
+    
+    except Exception as e:
+        print(f"Error creating merged DFXP: {e}")
+        return False
+
+def main():
+    parser = argparse.ArgumentParser(description='Merge multiple DFXP subtitle files')
+    parser.add_argument('--output', '-o', required=True, help='Output merged DFXP file')
+    parser.add_argument('--template', '-t', help='Template DFXP file (optional)')
+    parser.add_argument('--format', '-f', choices=['frames', 'seconds'], help='Preferred time format (frames or seconds)')
+    parser.add_argument('--framerate', '-r', type=float, default=25, help='Frame rate for frame-based timing (default: 25)')
+    parser.add_argument('input_files', nargs='+', help='Input DFXP files to merge')
+    
+    args = parser.parse_args()
+    
+    print(f"Merging {len(args.input_files)} DFXP files...")
+    print(f"Using frame rate: {args.framerate} fps")
+    
+    # Extract subtitle elements from all input files
+    all_subtitles = []
+    for input_file in args.input_files:
+        if not os.path.exists(input_file):
+            print(f"Warning: File not found: {input_file}")
+            continue
+            
+        print(f"Processing: {input_file}")
+        subtitles = extract_subtitle_elements(input_file, args.framerate)
+        print(f"  - Found {len(subtitles)} subtitle elements")
+        all_subtitles.extend(subtitles)
+    
+    if not all_subtitles:
+        print("Error: No subtitle elements found in any input files")
+        return
+    
+    # Create merged DFXP file
+    template = args.template if args.template else None
+    success = create_merged_dfxp(all_subtitles, args.output, template, args.format, args.framerate)
+    
+    if success:
+        print(f"Merger completed successfully. Output: {args.output}")
+    else:
+        print("Merger failed.")
+
+if __name__ == "__main__":
+    main()

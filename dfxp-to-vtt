@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""
+dfxp2vtt - Outil en ligne de commande pour convertir des fichiers DFXP en VTT avec pycaption.
+Usage: python dfxp2vtt.py -i input.dfxp -o output.vtt
+"""
+
+import argparse
+import sys
+import os
+from pycaption import DFXPReader, WebVTTWriter
+
+def convert_dfxp_to_vtt(input_file, output_file, verbose=False):
+    """
+    Convertit un fichier DFXP en VTT en utilisant pycaption.
+    
+    Args:
+        input_file (str): Chemin du fichier DFXP d'entrée
+        output_file (str): Chemin du fichier VTT de sortie
+        verbose (bool): Affiche des informations détaillées pendant la conversion
+    
+    Returns:
+        bool: True si la conversion réussit, False sinon
+    """
+    try:
+        # Lecture du fichier DFXP
+        if verbose:
+            print(f"Lecture du fichier DFXP: {input_file}")
+        
+        with open(input_file, 'r', encoding='utf-8') as f_in:
+            dfxp_content = f_in.read()
+        
+        # Conversion avec pycaption
+        if verbose:
+            print("Conversion DFXP vers VTT...")
+        
+        reader = DFXPReader()
+        if not reader.detect(dfxp_content):
+            print("Erreur: Le fichier ne semble pas être au format DFXP valide.")
+            return False
+        
+        caption_set = reader.read(dfxp_content)
+        vtt_content = WebVTTWriter().write(caption_set)
+        
+        # Écriture du fichier VTT
+        if verbose:
+            print(f"Écriture du fichier VTT: {output_file}")
+        
+        with open(output_file, 'w', encoding='utf-8') as f_out:
+            f_out.write(vtt_content)
+        
+        if verbose:
+            print("Conversion réussie!")
+        
+        return True
+    
+    except Exception as e:
+        print(f"Erreur lors de la conversion: {e}")
+        return False
+
+def main():
+    # Configuration du parseur d'arguments
+    parser = argparse.ArgumentParser(
+        description='Convertit des fichiers DFXP en VTT en utilisant pycaption.'
+    )
+    parser.add_argument('-i', '--input', required=True, 
+                        help='Chemin vers le fichier DFXP d\'entrée')
+    parser.add_argument('-o', '--output', 
+                        help='Chemin vers le fichier VTT de sortie (optionnel)')
+    parser.add_argument('-v', '--verbose', action='store_true', 
+                        help='Affiche des informations détaillées')
+    
+    args = parser.parse_args()
+    
+    # Vérification de l'existence du fichier d'entrée
+    if not os.path.exists(args.input):
+        print(f"Erreur: Le fichier {args.input} n'existe pas.")
+        return 1
+    
+    # Définition du fichier de sortie s'il n'est pas spécifié
+    if not args.output:
+        args.output = os.path.splitext(args.input)[0] + '.vtt'
+    
+    # Conversion
+    success = convert_dfxp_to_vtt(args.input, args.output, args.verbose)
+    
+    return 0 if success else 1
+
+if __name__ == "__main__":
+    sys.exit(main())

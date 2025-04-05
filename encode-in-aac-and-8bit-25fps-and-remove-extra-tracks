@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import json
+import time
+from pathlib import Path
+from rich.console import Console
+from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn
+from rich.panel import Panel
+from rich.table import Table
+from rich.live import Live
+from rich import box
+
+class VideoConverter:
+    def __init__(self, base_dir, output_dir=None):
+        self.base_dir = Path(os.path.expanduser(base_dir)).resolve()
+        self.output_dir = Path(os.path.expanduser(output_dir)).resolve() if output_dir else None
+        self.progress_file = self.base_dir / '.conversion_progress.json'
+        self.conversion_state = self._load_progress()
+        self.files_to_process = []
+        self.console = Console()
+
+    def _load_progress(self):
+        if self.progress_file.exists():
+            try:
+                with open(self.progress_file) as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                return {'completed': [], 'in_progress': None}
+        return {'completed': [], 'in_progress': None}
+
+    def _save_progress(self):
+        with open(self.progress_file, 'w') as f:
+            json.dump(self.conversion_state, f)
+
+    def get_descriptive_name(self, input_file, video_info):
+        """Create a descriptive name for the original file based on its properties"""
+        stem = input_file.stem
+        suffix = input_file.suffix
+        
+        # Build descriptor
+        descriptors = []
+        if video_info['is_10bit']:
+            descriptors.append("10bit")
+        else:
+            descriptors.append("8bit")
+            
+        if video_info['fps'] > 25:
+            descriptors.append("50fps")
+        else:
+            descriptors.append("25fps")
+        
+        # Create new name
+        descriptor_str = "_".join(descriptors)
+        return f"{stem}_{descriptor_str}{suffix}"
+
+    def rename_original(self, input_file, video_info):
+        """Rename the original file with descriptive properties unless it already has format info"""
+        # Check if file already has format info
+        if any(suffix in input_file.stem for suffix in ['_10bit', '_8bit', '_50fps', '_25fps']):
+            return input_file
+            
+        new_name = input_file.parent / self.get_descriptive_name(input_file, video_info)
+        if not new_name.exists():
+            input_file.rename(new_name)
+            return new_name
+        return input_file
+
+    def check_gpu_support(self):
+        try:
+            # Check if VideoToolbox is available
+            result = subprocess.run([
+                'ffmpeg', '-encoders'
+            ], capture_output=True, text=True, check=True)
+            
+            if 'h264_videotoolbox' in result.stdout:
+                self.console.print("[bold green]✓ Apple Silicon hardware encoding available")
+                return True
+            else:
+                self.console.print("[yellow]⚠ VideoToolbox not available, using CPU")
+                return False
+        except Exception:
+            self.console.print("[yellow]⚠ Could not check GPU support, using CPU")
+            return False
+
+    def check_video_properties(self, file_path):
+        try:
+            result = subprocess.run([
+                'ffprobe',
+                '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=codec_name,pix_fmt,r_frame_rate,bit_rate',
+                '-of', 'json',
+                str(file_path)
+            ], capture_output=True, text=True, check=True)
+            
+            data = json.loads(result.stdout)
+            if 'streams' in data and data['streams']:
+                stream = data['streams'][0]
+                pix_fmt = stream.get('pix_fmt', '')
+                
+                bit10_formats = [
+                    'yuv420p10le', 'yuv422p10le', 'yuv444p10le',
+                    'p010le', 'x2rgb10le', 'gray10le',
+                    'gbrp10le', 'gbrap10le'
+                ]
+                
+                is_10bit = (
+                    any(fmt in pix_fmt for fmt in bit10_formats) or
+                    (stream.get('bits_per_raw_sample') and int(stream.get('bits_per_raw_sample')) > 8)
+                )
+
+                frame_rate = stream.get('r_frame_rate', '25/1')
+                num, den = map(float, frame_rate.split('/'))
+                fps = num / den if den != 0 else 25
+
+                bit_rate = stream.get('bit_rate')
+                if bit_rate:
+                    bit_rate = int(bit_rate)
+                
+                return {
+                    'is_10bit': is_10bit,
+                    'fps': fps,
+                    'bit_rate': bit_rate
+                }
+                
+            return {'is_10bit': False, 'fps': 25, 'bit_rate': None}
+        except Exception as e:
+            self.console.print(f"[yellow]Warning: Could not determine video properties for {file_path}: {e}")
+            return {'is_10bit': False, 'fps': 25, 'bit_rate': None}
+
+    def check_ffmpeg(self):
+        try:
+            result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, check=True)
+            self.console.print("[bold green]✓ FFmpeg found")
+            version_line = result.stdout.split('\n')[0]
+            self.console.print(f"[cyan]Version: {version_line}[/cyan]")
+            return True
+        except (subprocess.SubprocessError, FileNotFoundError):
+            self.console.print("[bold red]✗ Error: FFmpeg not found. Please install FFmpeg first.")
+            return False
+
+    def has_aac_version(self, file_path):
+        """Check if a file has an AAC version with either extension"""
+        stem = file_path.stem
+        parent = file_path.parent
+        
+        # Remove any encoding info from the stem
+        for suffix in ['_10bit', '_8bit', '_50fps', '_25fps']:
+            stem = stem.replace(suffix, '')
+            
+        # Check for both possible AAC versions (.mp4 and .mov)
+        possible_aac_files = [
+            parent / f"{stem}_AAC.mp4",
+            parent / f"{stem}_AAC.MP4",
+            parent / f"{stem}_AAC.mov",
+            parent / f"{stem}_AAC.MOV"
+        ]
+        
+        # If output directory is specified, also check there
+        if self.output_dir:
+            rel_path = file_path.parent.relative_to(self.base_dir)
+            output_parent = self.output_dir / rel_path
+            possible_aac_files.extend([
+                output_parent / f"{stem}_8bit_25fps_AAC.mp4",
+                output_parent / f"{stem}_8bit_25fps_AAC.MP4",
+                output_parent / f"{stem}_8bit_25fps_AAC.mov",
+                output_parent / f"{stem}_8bit_25fps_AAC.MOV"
+            ])
+            
+        return any(aac_file.exists() for aac_file in possible_aac_files)
+
+    def find_video_files(self):
+        video_files = []
+        renamed_files = set()  # Track which files we've renamed
+        
+        for root, _, files in os.walk(self.base_dir):
+            for filename in files:
+                if filename.startswith('._'):  # Skip macOS metadata files
+                    continue
+                    
+                if filename.upper().endswith('_AAC.MP4') or filename.upper().endswith('_AAC.MOV'):
+                    continue
+                    
+                if filename.lower().endswith(('.mp4', '.mov')):
+                    full_path = Path(root) / filename
+                    
+                    # First get video info as we need it for both renaming and conversion
+                    video_info = self.check_video_properties(full_path)
+                    
+                    # First try to rename if needed
+                    try:
+                        if full_path not in renamed_files:  # Avoid trying to rename the same file twice
+                            renamed_path = self.rename_original(full_path, video_info)
+                            renamed_files.add(renamed_path)  # Track the new path
+                            full_path = renamed_path  # Update path for AAC checking
+                    except Exception as e:
+                        self.console.print(f"[yellow]Warning: Could not rename {filename}: {str(e)}[/yellow]")
+                    
+                    # Now check for AAC version (using potentially renamed path)
+                    if self.has_aac_version(full_path):
+                        self.console.print(f"[yellow]Skipping {full_path.name} - AAC version exists[/yellow]")
+                        continue
+                        
+                    video_files.append((full_path, video_info))
+                    
+        return sorted(video_files, key=lambda x: str(x[0]))
+
+    def get_output_path(self, input_file):
+        # Get the base name without any existing format suffixes
+        stem = input_file.stem
+        for suffix in ['_10bit', '_8bit', '_50fps', '_25fps']:
+            stem = stem.replace(suffix, '')
+        
+        # Always append 8bit_25fps_AAC as these are our target formats
+        new_filename = f"{stem}_8bit_25fps_AAC{input_file.suffix}"
+        
+        if self.output_dir:
+            # Calculate relative path from input base directory
+            rel_path = input_file.parent.relative_to(self.base_dir)
+            # Create the same directory structure in output directory
+            output_path = self.output_dir / rel_path / new_filename
+            # Ensure the directory exists
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            return output_path
+        else:
+            # Original behavior - output next to input file
+            return input_file.parent / new_filename
+
+    def get_partial_path(self, output_path):
+        return output_path.parent / f"{output_path.stem}.partial{output_path.suffix}"
+
+    def convert_file(self, input_file, video_info, task_id, progress):
+        try:
+            # First rename the original file
+            input_path = self.rename_original(input_file, video_info)
+        except Exception as e:
+            self.console.print(f"[yellow]Warning: Could not rename original file: {str(e)}[/yellow]")
+            input_path = Path(input_file).resolve()
+        
+        tracking_key = str(input_path.relative_to(self.base_dir))
+        output_path = self.get_output_path(input_path)
+        partial_path = self.get_partial_path(output_path)
+        
+        if tracking_key in self.conversion_state['completed']:
+            return True
+                
+        if output_path.exists():
+            self.conversion_state['completed'].append(tracking_key)
+            self._save_progress()
+            return True
+            
+        self.conversion_state['in_progress'] = tracking_key
+        self._save_progress()
+        
+        try:
+            # Print video properties before conversion
+            self.console.print(f"\n[bold cyan]Video properties for {input_path.name}:[/bold cyan]")
+            self.console.print(f"Is 10-bit: {video_info['is_10bit']}")
+            self.console.print(f"Frame rate: {video_info['fps']}")
+            self.console.print(f"Original bitrate: {video_info['bit_rate']}")
+            self.console.print(f"Output path: {output_path}")
+
+            # Get video duration for progress tracking
+            probe_result = subprocess.run([
+                'ffprobe',
+                '-v', 'quiet',
+                '-print_format', 'json',
+                '-show_format',
+                '-show_streams',
+                str(input_path)
+            ], capture_output=True, text=True, check=True)
+            
+            probe_data = json.loads(probe_result.stdout)
+            duration = float(probe_data['format']['duration'])
+            
+            # Print all stream information
+            self.console.print("\n[bold cyan]All streams found:[/bold cyan]")
+            for idx, stream in enumerate(probe_data['streams']):
+                codec_type = stream.get('codec_type', 'unknown')
+                codec_name = stream.get('codec_name', 'unknown')
+                self.console.print(f"Stream #{idx}: Type: {codec_type}, Codec: {codec_name}")
+
+            # Get original video bitrate or set a default
+            bit_rate = video_info['bit_rate']
+            if bit_rate and video_info['fps'] > 25:
+                # Adjust bitrate proportionally for frame rate reduction
+                target_bitrate = str(int(bit_rate * 25 / video_info['fps']))
+            elif bit_rate:
+                target_bitrate = str(bit_rate)
+            else:
+                target_bitrate = "20M"  # Default fallback
+            
+            # Base FFmpeg command with input
+            ffmpeg_command = ['ffmpeg', '-i', str(input_path)]
+            
+            # Map only video and audio streams
+            ffmpeg_command.extend(['-map', '0:v'])  # All video streams
+            ffmpeg_command.extend(['-map', '0:a'])  # All audio streams
+            
+            # Video encoding settings
+            if video_info['is_10bit'] or video_info['fps'] > 25:
+                ffmpeg_command.extend([
+                    '-c:v', 'h264_videotoolbox',
+                    '-b:v', target_bitrate,
+                    '-maxrate', target_bitrate,
+                    '-bufsize', target_bitrate
+                ])
+
+                if video_info['is_10bit']:
+                    ffmpeg_command.extend([
+                        '-vf', 'zscale=t=linear:npl=100,format=gbrp,zscale=p=bt709:t=bt709:m=bt709:r=full,format=yuv420p',
+                        '-pix_fmt', 'yuv420p'
+                    ])
+
+                if video_info['fps'] > 25:
+                    ffmpeg_command.extend(['-r', '25'])
+            else:
+                ffmpeg_command.extend(['-c:v', 'copy'])
+            
+            # Audio encoding settings (remove tracks 2 and 3 if they exist)
+            ffmpeg_command.extend(['-map', '-0:a:2', '-map', '-0:a:3'])
+            ffmpeg_command.extend([
+                '-c:a', 'aac',
+                '-b:a', '192k',
+                '-ar', '48000',
+                '-aac_coder', 'twoloop',
+                '-profile:a', 'aac_low'
+            ])
+            
+            # Add output path
+            ffmpeg_command.extend(['-y', str(partial_path)])
+            
+            # Print the complete FFmpeg command
+            self.console.print("\n[bold cyan]Running FFmpeg command:[/bold cyan]")
+            self.console.print(" ".join(ffmpeg_command))
+            self.console.print()
+            
+            process = subprocess.Popen(
+                ffmpeg_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+            
+            start_time = time.time()
+            ffmpeg_output = []  # Store all FFmpeg output
+            
+            while True:
+                output = process.stderr.readline()
+                
+                if output == '' and process.poll() is not None:
+                    break
+                    
+                if output:
+                    ffmpeg_output.append(output.strip())
+                    
+                if output and 'time=' in output:
+                    try:
+                        time_str = output.split('time=')[1].split()[0]
+                        if time_str == 'N/A':
+                            continue
+                            
+                        current_time = sum(float(x) * 60 ** i for i, x in enumerate(reversed(time_str.split(':'))))
+                        progress_value = (current_time / duration) * 100
+                        current_size = partial_path.stat().st_size if partial_path.exists() else 0
+                        speed = current_size / (time.time() - start_time) / 1024 / 1024
+                        
+                        # Determine conversion type for display
+                        conversions = []
+                        if video_info['is_10bit']:
+                            conversions.append("10→8bit")
+                        if video_info['fps'] > 25:
+                            conversions.append("50→25fps")
+                        if not conversions:
+                            conversions.append("AAC")
+                        conversion_type = "+".join(conversions)
+                        
+                        progress.update(task_id, completed=progress_value, 
+                                      description=f"{input_path.name} ({conversion_type}) {speed:.1f}MB/s")
+                    except Exception as e:
+                        # Silently ignore progress update errors
+                        pass
+            
+            if process.returncode == 0:
+                partial_path.rename(output_path)
+                self.conversion_state['completed'].append(tracking_key)
+                self.conversion_state['in_progress'] = None
+                self._save_progress()
+                return True
+            else:
+                # Show error details
+                self.console.print("\n[bold red]FFmpeg Error:[/bold red]")
+                if ffmpeg_output:
+                    self.console.print("\n[red]Last few lines of FFmpeg output:[/red]")
+                    for line in ffmpeg_output[-10:]:
+                        self.console.print(line)
+                raise Exception(f"FFmpeg process failed with return code {process.returncode}")
+            
+        except Exception as e:
+            if partial_path.exists():
+                partial_path.unlink()
+            self.conversion_state['in_progress'] = None
+            self._save_progress()
+            self.console.print(f"[red]Error processing {input_path.name}: {str(e)}")
+            return False
+
+    def process_directory(self):
+        if not self.check_ffmpeg():
+            return False
+            
+        # Create output directory if specified
+        if self.output_dir:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        with Live(Panel("Scanning for video files...", title="Video Converter", border_style="blue"), console=self.console) as live:
+            self.files_to_process = self.find_video_files()
+            
+            if not self.files_to_process:
+                live.update(Panel("[yellow]No video files found!", title="Video Converter", border_style="yellow"))
+                return True
+
+            needs_conversion = sum(1 for _, info in self.files_to_process 
+                                 if info['is_10bit'] or info['fps'] > 25)
+            copy_only = len(self.files_to_process) - needs_conversion
+
+            progress = Progress(
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(complete_style="green"),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TimeRemainingColumn(),
+                expand=True
+            )
+            
+            total_progress = Progress(
+                TextColumn("[bold cyan]Overall Progress"),
+                BarColumn(complete_style="blue"),
+                TextColumn("{task.completed}/{task.total}"),
+                TimeRemainingColumn(),
+                expand=True
+            )
+
+            layout = Table.grid(padding=(1, 0))
+            summary = f"[bold blue]Found {len(self.files_to_process)} files:[/bold blue]\n"
+            if needs_conversion > 0:
+                summary += f"• [yellow]{needs_conversion}[/yellow] files need conversion\n"
+            summary += f"• [green]{copy_only}[/green] files need audio only"
+            if self.output_dir:
+                summary += f"\n[bold cyan]Output directory:[/bold cyan] {self.output_dir}"
+            layout.add_row(Panel.fit(summary, box=box.DOUBLE))
+            layout.add_row(Panel(progress, box=box.ROUNDED))
+            layout.add_row(Panel(total_progress, box=box.ROUNDED))
+            live.update(layout)
+
+            total_task = total_progress.add_task("progress", total=len(self.files_to_process))
+            success = True
+
+            for file, video_info in self.files_to_process:
+                file_task = progress.add_task(
+                    str(file.name),
+                    total=100
+                )
+                
+                if not self.convert_file(file, video_info, file_task, progress):
+                    success = False
+                
+                progress.remove_task(file_task)
+                total_progress.advance(total_task)
+
+            if success:
+                layout.add_row(Panel("[bold green]✓ All files converted successfully!", border_style="green"))
+            else:
+                layout.add_row(Panel("[bold red]✗ Some files failed to convert!", border_style="red"))
+            live.update(layout)
+
+        return success
+
+def main():
+    if len(sys.argv) < 2 or len(sys.argv) > 3:
+        console = Console()
+        console.print(Panel(
+            "[bold red]Error:[/bold red] Incorrect number of arguments\n\n"
+            f"Usage: {sys.argv[0]} <input_directory> [output_directory]",
+            title="Video Converter",
+            border_style="red"
+        ))
+        sys.exit(1)
+        
+    input_dir = sys.argv[1]
+    output_dir = sys.argv[2] if len(sys.argv) == 3 else None
+    
+    if not os.path.isdir(input_dir):
+        console = Console()
+        console.print(f"[bold red]Error:[/bold red] {input_dir} is not a directory")
+        sys.exit(1)
+        
+    if output_dir and os.path.exists(output_dir) and not os.path.isdir(output_dir):
+        console = Console()
+        console.print(f"[bold red]Error:[/bold red] {output_dir} exists but is not a directory")
+        sys.exit(1)
+        
+    converter = VideoConverter(input_dir, output_dir)
+    success = converter.process_directory()
+    sys.exit(0 if success else 1)
+
+if __name__ == '__main__':
+    main()

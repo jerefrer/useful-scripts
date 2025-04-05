@@ -1,0 +1,13 @@
+cmd = [
+        'ffmpeg',
+        '-y',
+        '-i', str(input_file),
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',    # Fastest encoding
+        '-crf', '26',             # Lower quality but smaller files
+        '-vf', 'scale=-2:720',    # Scale to 720p
+        '-c:a', 'aac',
+        '-b:a', '96k',            # Lower audio bitrate
+        '-movflags', '+faststart',
+        str(output_file)
+    ]
