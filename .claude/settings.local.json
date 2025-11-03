@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./replace-color-in-pdf:*)",
+      "Bash(perl -pe:*)",
+      "Bash(/tmp/check_pdf.sh:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
