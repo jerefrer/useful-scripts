@@ -1,8 +1,18 @@
 #!/bin/bash
 
+# Debug mode
+DEBUG=false
+if [ "$1" = "--debug" ] || [ "$1" = "-d" ]; then
+    DEBUG=true
+    shift
+fi
+
 # Function to display usage information
 usage() {
-    echo "Usage: $0 <input_pdf> [output_pdf] [from_color] [to_color]"
+    echo "Usage: $0 [--debug] <input_pdf> [output_pdf] [from_color] [to_color]"
+    echo ""
+    echo "Options:"
+    echo "  --debug, -d : Show debug information during processing"
     echo ""
     echo "Arguments:"
     echo "  input_pdf   : Input PDF file (required)"
@@ -153,13 +163,43 @@ to_color_pdf=$(convert_color "$to_color")
 temp_file=$(mktemp)
 
 # Uncompress PDF
+if [ "$DEBUG" = true ]; then
+    echo "Debug: Uncompressing PDF..."
+fi
 pdftk "$input_file" output "$temp_file" uncompress
+
+# Count color operators before replacement (for debug)
+if [ "$DEBUG" = true ]; then
+    rgb_count=$(grep -oE '[0-9.]+ [0-9.]+ [0-9.]+ (rg|RG)' "$temp_file" | wc -l)
+    cmyk_count=$(grep -oE '[0-9.]+ [0-9.]+ [0-9.]+ [0-9.]+ (k|K)' "$temp_file" | wc -l)
+    gray_count=$(grep -oE '[0-9.]+ (g|G)' "$temp_file" | wc -l)
+    scn_count=$(grep -oE '[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+(scn|SCN)' "$temp_file" | wc -l)
+    echo "Debug: Found $rgb_count RGB color operators (rg/RG)"
+    echo "Debug: Found $cmyk_count CMYK color operators (k/K)"
+    echo "Debug: Found $gray_count Grayscale color operators (g/G)"
+    echo "Debug: Found $scn_count SetColor operators (scn/SCN)"
+    echo "Debug: Analyzing color samples..."
+    echo "Debug: RGB samples:"
+    grep -oE '[0-9.]+ [0-9.]+ [0-9.]+ (rg|RG)' "$temp_file" | head -5
+    echo "Debug: CMYK samples:"
+    grep -oE '[0-9.]+ [0-9.]+ [0-9.]+ [0-9.]+ (k|K)' "$temp_file" | head -5
+    echo "Debug: Grayscale samples:"
+    grep -oE '[0-9.]+ (g|G)' "$temp_file" | head -5
+    echo "Debug: SetColor (CMYK) samples:"
+    grep -oE '[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+(scn|SCN)' "$temp_file" | head -5
+fi
 
 if [ "$use_tolerance" = true ]; then
     # Replace black and near-black colors (tolerance mode)
     # Matches colors where all RGB values are <= 0.15 (approximately #262626)
     # This includes pure black (0,0,0) and dark colors like #221f20
 
+    if [ "$DEBUG" = true ]; then
+        echo "Debug: Tolerance mode - replacing dark colors (R,G,B <= 0.15)"
+        echo "Debug: Target color: $to_color_pdf"
+    fi
+
+    # RGB tolerance replacement
     perl -i -pe '
         s{
             (\b0?\.?\d{1,2}(?:\.\d+)?\b)  # First number (R)
@@ -179,16 +219,91 @@ if [ "$use_tolerance" = true ]; then
             }
         }xge
     ' "$temp_file"
+
+    # CMYK tolerance replacement (black in CMYK is 0 0 0 1, dark colors have high K value)
+    perl -i -pe '
+        s{
+            (\b0?\.?\d{1,2}(?:\.\d+)?\b)  # C
+            (\s+)
+            (\b0?\.?\d{1,2}(?:\.\d+)?\b)  # M
+            (\s+)
+            (\b0?\.?\d{1,2}(?:\.\d+)?\b)  # Y
+            (\s+)
+            (\b0?\.?\d{1,2}(?:\.\d+)?\b)  # K
+            (\s+)
+            (k|K)\b                        # Operator
+        }{
+            my ($c, $s1, $m, $s2, $y, $s3, $k, $s4, $op) = ($1, $2, $3, $4, $5, $6, $7, $8, $9);
+            # Check if K >= 0.85 (dark/black in CMYK)
+            if ($k >= 0.85 && $c <= 0.15 && $m <= 0.15 && $y <= 0.15) {
+                "'"$to_color_pdf"'$s4$op"
+            } else {
+                "$c$s1$m$s2$y$s3$k$s4$op"
+            }
+        }xge
+    ' "$temp_file"
+
+    # Grayscale tolerance replacement (0 is black, values <= 0.15 are dark)
+    perl -i -pe '
+        s/(\d+(?:\.\d+)?)\s+(g|G)\b/do{
+            my ($gray, $op) = ($1, $2);
+            if ($gray <= 0.15) {
+                "'"$to_color_pdf"' rg";
+            } else {
+                "$gray $op";
+            }
+        }/ge
+    ' "$temp_file"
+
+    # SetColor (scn/SCN) tolerance replacement - handles CMYK format
+    # Also need to change the color space from /CS0 cs to /DeviceRGB cs for rg to work
+    perl -i -pe '
+        # First replace the color space definitions for black colors
+        s{(/CS\d+)\s+(cs|CS)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(scn|SCN)\b}{
+            my ($csname, $csop, $c, $m, $y, $k, $op) = ($1, $2, $3, $4, $5, $6, $7);
+            # Check if it is dark (high K value and low CMY)
+            if ($k >= 0.85 && $c <= 0.15 && $m <= 0.15 && $y <= 0.15) {
+                "/DeviceRGB $csop '"$to_color_pdf"' rg";
+            } else {
+                "$csname $csop $c $m $y $k $op";
+            }
+        }ge
+    ' "$temp_file"
 else
     # Exact color replacement mode
     from_color_pdf=$(convert_color "$from_color")
 
-    # Replace exact color matches
+    if [ "$DEBUG" = true ]; then
+        echo "Debug: Exact mode - replacing $from_color_pdf"
+        echo "Debug: Target color: $to_color_pdf"
+    fi
+
+    # Replace exact RGB color matches
     perl -i -pe 's/\Q'"$from_color_pdf"'\E rg/'"$to_color_pdf"' rg/g' "$temp_file"
     perl -i -pe 's/\Q'"$from_color_pdf"'\E RG/'"$to_color_pdf"' RG/g' "$temp_file"
+
+    # Replace grayscale if it matches (convert single value to RGB equivalent)
+    # Extract first component of from_color to check if it's grayscale
+    gray_value=$(echo "$from_color_pdf" | awk '{print $1}')
+    perl -i -pe 's/\b'"$gray_value"' (g|G)\b/'"$to_color_pdf"' rg/g' "$temp_file"
+fi
+
+# Count replacements (for debug)
+if [ "$DEBUG" = true ]; then
+    rgb_after=$(grep -oE '[0-9.]+ [0-9.]+ [0-9.]+ (rg|RG)' "$temp_file" | wc -l)
+    gray_after=$(grep -oE '[0-9.]+ (g|G)' "$temp_file" | wc -l)
+    scn_after=$(grep -oE '[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+[0-9.]+\s+(scn|SCN)' "$temp_file" | wc -l)
+    new_color_count=$(grep -F "$to_color_pdf" "$temp_file" | wc -l)
+    echo "Debug: RGB operators after: $rgb_after (was $rgb_count)"
+    echo "Debug: Grayscale operators after: $gray_after (was $gray_count)"
+    echo "Debug: SetColor operators after: $scn_after (was $scn_count)"
+    echo "Debug: New color occurrences: $new_color_count"
 fi
 
 # Compress and save output
+if [ "$DEBUG" = true ]; then
+    echo "Debug: Compressing and saving to $output_file..."
+fi
 pdftk "$temp_file" output "$output_file" compress
 
 # Clean up
