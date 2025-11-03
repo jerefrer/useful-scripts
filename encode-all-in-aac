@@ -23,13 +23,17 @@ def get_video_duration(file_path):
     except:
         return None
 
-def convert_to_aac(input_file, total_files, current_file, total_duration, elapsed_duration):
+def convert_to_aac(input_file, total_files, current_file, total_duration, elapsed_duration, dest_folder=None):
     file_path = Path(input_file)
-    parent_dir = file_path.parent
     filename = file_path.stem
     extension = file_path.suffix
-    
-    output_file = parent_dir / f"{filename}_aac{extension}"
+
+    if dest_folder:
+        dest_folder = Path(dest_folder)
+        dest_folder.mkdir(parents=True, exist_ok=True)
+        output_file = dest_folder / f"{filename}{extension}"
+    else:
+        output_file = file_path.parent / f"{filename}_aac{extension}"
     
     duration = get_video_duration(input_file)
     
@@ -102,15 +106,22 @@ def is_macos_hidden(file_path):
     return file_path.name.startswith('._') or file_path.name.startswith('.')
 
 def main():
-    if len(sys.argv) != 2:
-        print("Usage: ./script.py <folder_path>")
+    if len(sys.argv) not in (2, 3):
+        print("Usage: ./script.py <source_folder> [destination_folder]")
         sys.exit(1)
-    
+
     folder_path = Path(sys.argv[1])
-    
+    dest_folder = Path(sys.argv[2]) if len(sys.argv) == 3 else None
+
     if not folder_path.exists() or not folder_path.is_dir():
         print(f"Error: {folder_path} is not a valid directory")
         sys.exit(1)
+    if dest_folder and not dest_folder.exists():
+        try:
+            dest_folder.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"Error: Could not create destination directory {dest_folder}: {e}")
+            sys.exit(1)
     
     # Find all video files recursively, including upper and lowercase extensions
     video_files = []
@@ -148,7 +159,7 @@ def main():
     
     for i, video_file in enumerate(video_files, 1):
         print(f"\nStarting file {i}/{total_files}: {video_file}")
-        duration = convert_to_aac(video_file, total_files, i, total_duration, elapsed_duration)
+        duration = convert_to_aac(video_file, total_files, i, total_duration, elapsed_duration, dest_folder)
         elapsed_duration += duration if duration else 0
 
 if __name__ == "__main__":

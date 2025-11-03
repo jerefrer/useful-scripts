@@ -1,0 +1,88 @@
+#!/bin/bash
+
+# Function to display usage information
+usage() {
+    echo "Usage: $0 -i INPUT_FILE -o OUTPUT_FILE [OPTIONS]"
+    echo "Reduce the size of a PDF file using Ghostscript."
+    echo
+    echo "Options:"
+    echo "  -i INPUT_FILE    Input PDF file (required)"
+    echo "  -o OUTPUT_FILE   Output PDF file (required)"
+    echo "  -s TARGET_SIZE   Target file size in bytes (default: no limit)"
+    echo "  -d DPI           Initial DPI setting (default: 150)"
+    echo "  -q QUALITY       PDF quality setting (default: printer)"
+    echo "                   Options: screen, ebook, printer, prepress"
+    echo "  -h               Display this help message"
+    exit 1
+}
+
+# Initialize variables with default values
+input_file=""
+output_file=""
+target_size=0
+dpi=600
+quality="printer"
+
+# Parse command-line options
+while getopts "i:o:s:d:q:h" opt; do
+    case $opt in
+        i) input_file="$OPTARG" ;;
+        o) output_file="$OPTARG" ;;
+        s) target_size="$OPTARG" ;;
+        d) dpi="$OPTARG" ;;
+        q) quality="$OPTARG" ;;
+        h) usage ;;
+        \?) echo "Invalid option: -$OPTARG" >&2; usage ;;
+    esac
+done
+
+# Check if required arguments are provided
+if [ -z "$input_file" ] || [ -z "$output_file" ]; then
+    echo "Error: Input and output files are required." >&2
+    usage
+fi
+
+# Check if input file exists
+if [ ! -f "$input_file" ]; then
+    echo "Error: Input file does not exist." >&2
+    exit 1
+fi
+
+# Function to reduce PDF size
+reduce_pdf_size() {
+    gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS=/$quality \
+       -dNOPAUSE -dQUIET -dBATCH \
+       -dDownsampleColorImages=true \
+       -dColorImageResolution=$dpi \
+       -dDownsampleGrayImages=true \
+       -dGrayImageResolution=$dpi \
+       -dDownsampleMonoImages=true \
+       -dMonoImageResolution=$dpi \
+       -sOutputFile="$output_file" \
+       "$input_file"
+}
+
+# Main logic
+if [ "$target_size" -eq 0 ]; then
+    # If no target size is specified, just reduce once
+    reduce_pdf_size
+else
+    # If target size is specified, reduce iteratively
+    while true; do
+        reduce_pdf_size
+        current_size=$(stat -f%z "$output_file")
+        
+        if [ "$current_size" -le "$target_size" ]; then
+            echo "Target size achieved with DPI: $dpi"
+            break
+        elif [ "$dpi" -le 72 ]; then
+            echo "Warning: Minimum DPI reached, file still larger than target size" >&2
+            break
+        else
+            dpi=$((dpi - 25))
+            echo "Retrying with DPI: $dpi"
+        fi
+    done
+fi
+
+echo "PDF size reduction complete. Output file: $output_file"

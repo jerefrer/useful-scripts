@@ -1,0 +1,26 @@
+#!/bin/bash
+
+echo "iCloud process killer script"
+echo "Press Ctrl+C to stop the script"
+
+while true; do
+    # Find and kill bird process (iCloud sync daemon)
+    bird_pid=$(pgrep bird)
+    if [ -n "$bird_pid" ]; then
+        echo "Killing bird process (PID: $bird_pid)"
+        kill -9 $bird_pid
+    else
+        echo "bird process not found"
+    fi
+
+    # Find and kill cloudd process (iCloud services)
+    cloudd_pid=$(pgrep cloudd)
+    if [ -n "$cloudd_pid" ]; then
+        echo "Killing cloudd process (PID: $cloudd_pid)"
+        kill -9 $cloudd_pid
+    else
+        echo "cloudd process not found"
+    fi
+
+    sleep 2
+done

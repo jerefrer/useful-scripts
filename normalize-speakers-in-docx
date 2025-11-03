@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""
+Convert speaker names in dialogue format to italic brackets in DOCX files.
+
+Usage:
+    python convert_speakers.py input.docx [output.docx]
+
+Examples:
+    python convert_speakers.py dialogue.docx
+    python convert_speakers.py dialogue.docx formatted_dialogue.docx
+
+Converts:
+    Olaf: This is awesome.
+    Rinpoche—Yes.
+To:
+    [Olaf]—This is awesome.
+    [Rinpoche]—Yes.
+"""
+
+import argparse
+import shutil
+import sys
+from pathlib import Path
+import re
+
+try:
+    from docx import Document
+    from docx.shared import RGBColor
+    from docx.oxml.shared import OxmlElement, qn
+except ImportError:
+    print("Error: python-docx library not found.")
+    print("Install it with: pip install python-docx")
+    sys.exit(1)
+
+
+def make_run_italic(run):
+    """Make a text run italic."""
+    run.italic = True
+
+
+def expand_speaker_abbreviation(speaker_abbrev):
+    """
+    Expand speaker abbreviations to full names.
+    """
+    abbreviations = {
+        'R': 'Rinpoche',
+        'TR': 'Tülku Rinpoche',
+        'TPWR': 'Tülku Pema Wangyal Rinpoche',
+        'JKR': 'Jigme Khyentse Rinpoche',
+        'RR': 'Rangdröl Rinpoche',
+        'JP': 'Jean-Pierre'
+    }
+    
+    return abbreviations.get(speaker_abbrev, speaker_abbrev)
+
+
+def is_valid_speaker_name(speaker_text):
+    """
+    Check if the text before colon/dash is likely a speaker name.
+    
+    Args:
+        speaker_text: The text before the separator
+    
+    Returns:
+        bool: True if it's likely a speaker name
+    """
+    # Remove extra whitespace and check length
+    speaker_text = speaker_text.strip()
+    
+    # Skip if empty or too long (likely not a speaker name)
+    if not speaker_text or len(speaker_text) > 50:
+        return False
+    
+    # Count words - speaker names should be 3 words or fewer
+    words = speaker_text.split()
+    if len(words) > 3:
+        return False
+    
+    # Check for common non-speaker patterns
+    # Skip if it contains quotes (likely part of dialogue)
+    if '"' in speaker_text or "'" in speaker_text:
+        return False
+    
+    # Skip if it starts with lowercase (likely middle of sentence)
+    if speaker_text[0].islower():
+        return False
+    
+    # Skip if it contains common sentence words that indicate it's not a speaker
+    non_speaker_indicators = [
+        'the', 'and', 'but', 'or', 'so', 'if', 'when', 'where', 'what', 'how',
+        'this', 'that', 'these', 'those', 'here', 'there', 'now', 'then',
+        'because', 'since', 'although', 'however', 'therefore', 'moreover'
+    ]
+    
+    # Check if any word in the speaker text is a common non-speaker word
+    for word in words:
+        if word.lower() in non_speaker_indicators:
+            return False
+    
+    return True
+
+
+def process_paragraph(paragraph):
+    """
+    Process a single paragraph to convert speaker format.
+    Returns True if paragraph was modified, False otherwise.
+    """
+    if not paragraph.text.strip():
+        return False
+    
+    text = paragraph.text.strip()
+    
+    # Check if already processed (starts with bracket)
+    if text.startswith('[') and ']—' in text:
+        return False
+    
+    # Find colon or em dash positions
+    colon_pos = text.find(':')
+    dash_pos = text.find('—')
+    
+    # Determine which separator comes first
+    if colon_pos >= 0 and dash_pos >= 0:
+        end_pos = min(colon_pos, dash_pos)
+    elif colon_pos >= 0:
+        end_pos = colon_pos
+    elif dash_pos >= 0:
+        end_pos = dash_pos
+    else:
+        return False
+    
+    # Extract speaker name and rest of text
+    speaker_name = text[:end_pos].strip()
+    rest_text = text[end_pos + 1:].strip()
+    
+    # Skip if no speaker name or no text after separator
+    if not speaker_name or not rest_text:
+        return False
+    
+    # Check if this is actually a speaker name
+    if not is_valid_speaker_name(speaker_name):
+        return False
+    
+    # Expand abbreviations
+    expanded_name = expand_speaker_abbreviation(speaker_name)
+    
+    # Clear the paragraph
+    paragraph.clear()
+    
+    # Add opening bracket
+    paragraph.add_run('[')
+    
+    # Add speaker name in italics (using expanded name)
+    speaker_run = paragraph.add_run(expanded_name)
+    make_run_italic(speaker_run)
+    
+    # Add closing bracket and em dash
+    paragraph.add_run(']—')
+    
+    # Add the rest of the text
+    paragraph.add_run(rest_text)
+    
+    return True
+
+
+def process_document(input_path, output_path=None):
+    """
+    Process a DOCX document to convert speaker names.
+    
+    Args:
+        input_path: Path to input DOCX file
+        output_path: Path to output DOCX file (optional)
+    """
+    input_file = Path(input_path)
+    
+    if not input_file.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+    
+    if not input_file.suffix.lower() == '.docx':
+        raise ValueError("Input file must be a .docx file")
+    
+    # Determine output path
+    if output_path is None:
+        # Create backup and update in place
+        backup_path = input_file.with_suffix(input_file.suffix + '.bak')
+        shutil.copy2(input_file, backup_path)
+        output_file = input_file
+        print(f"Created backup: {backup_path}")
+    else:
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Load document
+    try:
+        doc = Document(input_file)
+    except Exception as e:
+        raise Exception(f"Error loading document: {e}")
+    
+    # Process paragraphs
+    modified_count = 0
+    total_paragraphs = len(doc.paragraphs)
+    
+    for paragraph in doc.paragraphs:
+        if process_paragraph(paragraph):
+            modified_count += 1
+    
+    # Save document
+    try:
+        doc.save(output_file)
+        print(f"Processed {total_paragraphs} paragraphs, modified {modified_count}")
+        print(f"Output saved to: {output_file}")
+    except Exception as e:
+        raise Exception(f"Error saving document: {e}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert speaker names in dialogue format to italic brackets in DOCX files",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s dialogue.docx
+  %(prog)s dialogue.docx formatted_dialogue.docx
+
+Converts format like:
+  R: This is awesome.
+  TR—Yes.
+To:
+  [Rinpoche]—This is awesome.
+  [Tülku Rinpoche]—Yes.
+
+Expands these abbreviations:
+  R → Rinpoche
+  TR → Tülku Rinpoche
+  TPWR → Tülku Pema Wangyal Rinpoche
+  JKR → Jigme Khyentse Rinpoche
+  RR → Rangdröl Rinpoche
+  JP → Jean-Pierre
+        """
+    )
+    
+    parser.add_argument(
+        'input_file',
+        help='Input DOCX file path'
+    )
+    
+    parser.add_argument(
+        'output_file',
+        nargs='?',
+        help='Output DOCX file path (optional - if not provided, updates input file in place after creating backup)'
+    )
+    
+    parser.add_argument(
+        '--version',
+        action='version',
+        version='%(prog)s 1.0'
+    )
+    
+    args = parser.parse_args()
+    
+    try:
+        process_document(args.input_file, args.output_file)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

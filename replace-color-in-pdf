@@ -1,0 +1,197 @@
+#!/bin/bash
+
+# Function to display usage information
+usage() {
+    echo "Usage: $0 <input_pdf> [output_pdf] [from_color] [to_color]"
+    echo ""
+    echo "Arguments:"
+    echo "  input_pdf   : Input PDF file (required)"
+    echo "  output_pdf  : Output PDF file (optional, defaults to input with ' - Red' suffix)"
+    echo "  from_color  : Color to replace - RGB format (0,0,0) or hex (#000000)"
+    echo "                (optional, defaults to black with tolerance for near-black)"
+    echo "  to_color    : Replacement color - RGB or hex format (optional, default: #d12129)"
+    echo ""
+    echo "Examples:"
+    echo "  $0 input.pdf"
+    echo "    → Replaces black (with tolerance) with red, saves as 'input - Red.pdf'"
+    echo ""
+    echo "  $0 input.pdf #221f20"
+    echo "    → Replaces #221f20 with red, saves as 'input - Red.pdf'"
+    echo ""
+    echo "  $0 input.pdf #221f20 #00ff00"
+    echo "    → Replaces #221f20 with green, saves as 'input - Red.pdf'"
+    echo ""
+    echo "  $0 input.pdf output.pdf"
+    echo "    → Replaces black with red, saves as 'output.pdf'"
+    echo ""
+    echo "  $0 input.pdf output.pdf #221f20"
+    echo "    → Replaces #221f20 with red, saves as 'output.pdf'"
+    echo ""
+    echo "  $0 input.pdf output.pdf #221f20 #00ff00"
+    echo "    → Replaces #221f20 with green, saves as 'output.pdf'"
+    echo ""
+    echo "  $0 input.pdf 0.5,0.5,0.5 1,0,0"
+    echo "    → Replaces gray with red using RGB format"
+    exit 1
+}
+
+# Function to convert hex color to PDF RGB format (0-1 range)
+hex_to_pdf_rgb() {
+    local hex=$1
+    # Remove # if present
+    hex=${hex#\#}
+
+    # Validate hex format
+    if [[ ! $hex =~ ^[0-9A-Fa-f]{6}$ ]]; then
+        echo "Error: Invalid hex color format: #$hex" >&2
+        exit 1
+    fi
+
+    # Extract RGB components (hex to decimal)
+    local r=$((16#${hex:0:2}))
+    local g=$((16#${hex:2:2}))
+    local b=$((16#${hex:4:2}))
+
+    # Convert to PDF format (0-1 range)
+    # Using awk for more portable floating point math
+    echo "$r $g $b" | awk '{printf "%.2f %.2f %.2f", $1/255, $2/255, $3/255}'
+}
+
+# Function to convert color (RGB or hex) to PDF format
+convert_color() {
+    local color=$1
+
+    if [[ $color =~ ^#[0-9A-Fa-f]{6}$ ]]; then
+        # Hex format
+        hex_to_pdf_rgb "$color"
+    else
+        # RGB format - replace commas with spaces
+        echo "$color" | sed 's/,/ /g'
+    fi
+}
+
+# Check for help flag
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    usage
+fi
+
+# Check if input file is provided
+if [ -z "$1" ]; then
+    echo "Error: Input file is required."
+    usage
+fi
+
+input_file="$1"
+
+# Check if input file exists
+if [ ! -f "$input_file" ]; then
+    echo "Error: Input file '$input_file' does not exist."
+    exit 1
+fi
+
+# Function to check if argument looks like a color
+is_color() {
+    local arg="$1"
+    # Check if it starts with # (hex) or contains comma (RGB format)
+    [[ "$arg" =~ ^# ]] || [[ "$arg" =~ , ]] || [[ "$arg" =~ ^[0-9.]+$ ]]
+}
+
+# Smart argument parsing
+use_tolerance=true
+from_color=""
+to_color="#d12129"  # Default red
+output_file=""
+
+# Check second argument
+if [ -n "$2" ]; then
+    if is_color "$2"; then
+        # Second arg is from_color
+        from_color="$2"
+        use_tolerance=false
+
+        # Third arg (if present) is to_color
+        if [ -n "$3" ]; then
+            to_color="$3"
+        fi
+    else
+        # Second arg is output_file
+        output_file="$2"
+
+        # Third arg (if present) is from_color
+        if [ -n "$3" ]; then
+            from_color="$3"
+            use_tolerance=false
+        fi
+
+        # Fourth arg (if present) is to_color
+        if [ -n "$4" ]; then
+            to_color="$4"
+        fi
+    fi
+fi
+
+# Generate output filename if not provided
+if [ -z "$output_file" ]; then
+    # Extract directory, filename, and extension
+    dir=$(dirname "$input_file")
+    base=$(basename "$input_file")
+    filename="${base%.*}"
+    extension="${base##*.}"
+
+    # Handle case where dir is "."
+    if [ "$dir" = "." ]; then
+        output_file="${filename} - Red.${extension}"
+    else
+        output_file="${dir}/${filename} - Red.${extension}"
+    fi
+fi
+
+# Convert to_color to PDF format
+to_color_pdf=$(convert_color "$to_color")
+
+# Create a temporary file
+temp_file=$(mktemp)
+
+# Uncompress PDF
+pdftk "$input_file" output "$temp_file" uncompress
+
+if [ "$use_tolerance" = true ]; then
+    # Replace black and near-black colors (tolerance mode)
+    # Matches colors where all RGB values are <= 0.15 (approximately #262626)
+    # This includes pure black (0,0,0) and dark colors like #221f20
+
+    perl -i -pe '
+        s{
+            (\b0?\.?\d{1,2}(?:\.\d+)?\b)  # First number (R)
+            (\s+)
+            (\b0?\.?\d{1,2}(?:\.\d+)?\b)  # Second number (G)
+            (\s+)
+            (\b0?\.?\d{1,2}(?:\.\d+)?\b)  # Third number (B)
+            (\s+)
+            (rg|RG)\b                      # Operator
+        }{
+            my ($r, $s1, $g, $s2, $b, $s3, $op) = ($1, $2, $3, $4, $5, $6, $7);
+            # Check if all components are <= 0.15 (dark/black)
+            if ($r <= 0.15 && $g <= 0.15 && $b <= 0.15) {
+                "'"$to_color_pdf"'$s3$op"
+            } else {
+                "$r$s1$g$s2$b$s3$op"
+            }
+        }xge
+    ' "$temp_file"
+else
+    # Exact color replacement mode
+    from_color_pdf=$(convert_color "$from_color")
+
+    # Replace exact color matches
+    perl -i -pe 's/\Q'"$from_color_pdf"'\E rg/'"$to_color_pdf"' rg/g' "$temp_file"
+    perl -i -pe 's/\Q'"$from_color_pdf"'\E RG/'"$to_color_pdf"' RG/g' "$temp_file"
+fi
+
+# Compress and save output
+pdftk "$temp_file" output "$output_file" compress
+
+# Clean up
+rm "$temp_file"
+
+echo "Conversion complete. Output saved as '$output_file'"

@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+import argparse
+import os
+from pathlib import Path
+from collections import defaultdict
+from typing import List, Tuple
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+except ImportError:
+    print("Please install the 'rich' library for pretty tables: pip install rich")
+    exit(1)
+
+try:
+    import mutagen
+    from mutagen.mp3 import MP3
+    from mutagen.mp4 import MP4
+except ImportError:
+    mutagen = None
+
+try:
+    import ffmpeg
+except ImportError:
+    ffmpeg = None
+
+AUDIO_EXTS = {'.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma', '.alac'}
+VIDEO_EXTS = {'.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm', '.mpeg', '.mpg', '.m4v'}
+
+console = Console()
+
+def get_duration_ffmpeg(filepath: str) -> float:
+    """Get media duration in seconds using ffmpeg."""
+    if ffmpeg is None:
+        return 0.0
+    try:
+        probe = ffmpeg.probe(filepath)
+        return float(probe['format']['duration'])
+    except Exception:
+        return 0.0
+
+def get_audio_duration(filepath: str) -> float:
+    ext = Path(filepath).suffix.lower()
+    if mutagen:
+        try:
+            if ext == '.mp3':
+                return MP3(filepath).info.length
+            elif ext == '.mp4' or ext == '.m4a':
+                return MP4(filepath).info.length
+            else:
+                audio = mutagen.File(filepath)
+                if audio and hasattr(audio, 'info') and hasattr(audio.info, 'length'):
+                    return audio.info.length
+        except Exception:
+            pass
+    # fallback to ffmpeg
+    return get_duration_ffmpeg(filepath)
+
+def get_video_duration(filepath: str) -> float:
+    return get_duration_ffmpeg(filepath)
+
+def scan_folder(folder: Path) -> Tuple[int, float, float]:
+    num_files = 0
+    audio_duration = 0.0
+    video_duration = 0.0
+    for root, _, files in os.walk(folder):
+        for name in files:
+            num_files += 1
+            ext = Path(name).suffix.lower()
+            full_path = os.path.join(root, name)
+            if ext in AUDIO_EXTS:
+                audio_duration += get_audio_duration(full_path)
+            elif ext in VIDEO_EXTS:
+                video_duration += get_video_duration(full_path)
+    return num_files, audio_duration, video_duration
+
+def format_duration(seconds: float) -> str:
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hours:02}:{minutes:02}:{secs:02}"
+
+def format_duration_short(seconds: float) -> str:
+    weeks = int(seconds // (7 * 24 * 3600))
+    days = int((seconds % (7 * 24 * 3600)) // (24 * 3600))
+    hours = int((seconds % (24 * 3600)) // 3600)
+    minutes = int((seconds % 3600) // 60)
+    parts = []
+    if weeks:
+        parts.append(f"{weeks} week" if weeks == 1 else f"{weeks} weeks")
+    if days:
+        parts.append(f"{days} day" if days == 1 else f"{days} days")
+    if hours and not weeks:
+        parts.append(f"{hours} hour" if hours == 1 else f"{hours} hours")
+    if minutes and not weeks and not days:
+        parts.append(f"{minutes} min" if minutes == 1 else f"{minutes} mins")
+    return " ".join(parts) if parts else "0 min"
+
+def main():
+    parser = argparse.ArgumentParser(description="Display total duration and file count for folders.")
+    parser.add_argument('folders', nargs='+', help='List of folders to scan')
+    args = parser.parse_args()
+
+    table = Table()
+    table.add_column("Folder", style="cyan", no_wrap=True)
+    table.add_column("# Files", justify="right")
+    table.add_column("Audio Duration", justify="right")
+    table.add_column("Audio (w/d/h/m)", justify="right")
+    table.add_column("Video Duration", justify="right")
+    table.add_column("Video (w/d/h/m)", justify="right")
+
+    for folder in args.folders:
+        p = Path(folder)
+        if not p.exists() or not p.is_dir():
+            table.add_row(str(folder), "-", "-", "-")
+            continue
+        num_files, audio_dur, video_dur = scan_folder(p)
+        table.add_row(
+            str(folder),
+            str(num_files),
+            format_duration(audio_dur),
+            format_duration_short(audio_dur),
+            format_duration(video_dur),
+            format_duration_short(video_dur),
+        )
+    console.print(table)
+
+if __name__ == "__main__":
+    main()

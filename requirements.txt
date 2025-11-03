@@ -1,0 +1,3 @@
+rich
+mutagen
+ffmpeg-python

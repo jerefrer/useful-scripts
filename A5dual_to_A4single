@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# Path to the input PDF file
+input_pdf="input.pdf"
+
+# Output PDF file name
+output_pdf="output.pdf"
+
+# Temporary directory for intermediate files
+temp_dir="temp_split_pdf"
+mkdir -p "$temp_dir"
+
+# Split each page into two and save them as separate files
+page_count=$(mutool info "$input_pdf" | grep 'Pages:' | awk '{print $2}')
+for ((page=1; page<=page_count; page++)); do
+    # Split the page into left and right halves
+    mutool poster -x 2 "$input_pdf" "$temp_dir/split_${page}_%d.pdf" $page
+done
+
+# Merge the split pages into a single document
+split_files=$(ls $temp_dir/split_*_*.pdf | sort -V)
+mutool merge -o "$output_pdf" $split_files
+
+# Cleanup the temporary files
+rm -rf "$temp_dir"
+
+echo "Process completed. The output is saved as '$output_pdf'"
+
