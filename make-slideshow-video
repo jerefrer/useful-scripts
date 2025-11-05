@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+
+# Parse options
+SAMPLE_MODE=false
+SAMPLE_COUNT=10
+
+while [[ "$1" == --* ]]; do
+  case "$1" in
+    --sample)
+      SAMPLE_MODE=true
+      if [[ "$2" =~ ^[0-9]+$ ]]; then
+        SAMPLE_COUNT="$2"
+        shift
+      fi
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
+
+INPUT_DIR="$1"
+BATCH_SIZE=100
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+KBURNS_CLI="$SCRIPT_DIR/kburns-slideshow/kbvs-cli.py"
+FONT_FILE="$SCRIPT_DIR/Montserrat-Regular.ttf"
+
+if [ -z "$INPUT_DIR" ]; then
+  echo "Usage: $0 [--sample [N]] <input-folder>"
+  echo ""
+  echo "Creates a Ken Burns slideshow video from all images in the folder."
+  echo "Images from the same subfolder will have the same subtitle."
+  echo ""
+  echo "Options:"
+  echo "  --sample [N]  Generate video with only first N images (default: 10)"
+  echo "                Useful for quick preview before processing all images"
+  echo ""
+  echo "Examples:"
+  echo "  $0 ~/Downloads/Tibet"
+  echo "  → Creates ~/Downloads/Tibet/Tibet.mp4 with all images"
+  echo ""
+  echo "  $0 --sample ~/Downloads/Tibet"
+  echo "  → Creates ~/Downloads/Tibet/Tibet-sample.mp4 with 10 images"
+  echo ""
+  echo "  $0 --sample 5 ~/Downloads/Tibet"
+  echo "  → Creates ~/Downloads/Tibet/Tibet-sample.mp4 with 5 images"
+  exit 1
+fi
+
+if [ ! -f "$KBURNS_CLI" ]; then
+  echo "Error: kbvs-cli.py not found at $KBURNS_CLI"
+  echo "Please ensure kburns-slideshow is in the same directory as this script"
+  exit 1
+fi
+
+if [ ! -f "$FONT_FILE" ]; then
+  echo "Error: Montserrat-Regular.ttf not found at $FONT_FILE"
+  echo "Please ensure the font file is in the same directory as this script"
+  exit 1
+fi
+
+# Get absolute paths
+INPUT_ABS=$(cd "$INPUT_DIR" && pwd)
+FOLDER_NAME=$(basename "$INPUT_ABS")
+
+# Set output filename based on mode
+if [ "$SAMPLE_MODE" = true ]; then
+  OUTPUT_FILE="$INPUT_ABS/${FOLDER_NAME}-sample.mp4"
+else
+  OUTPUT_FILE="$INPUT_ABS/${FOLDER_NAME}.mp4"
+fi
+
+if [ "$SAMPLE_MODE" = true ]; then
+  echo "🖼️  Scanning for images in $INPUT_ABS (SAMPLE MODE - first $SAMPLE_COUNT images)..."
+else
+  echo "🖼️  Scanning for images in $INPUT_ABS..."
+fi
+
+# Find all images and sort
+temp_list=$(mktemp)
+find "$INPUT_ABS" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | sort > "$temp_list"
+
+total_images=$(wc -l < "$temp_list" | tr -d ' ')
+
+# Limit to sample count if in sample mode
+if [ "$SAMPLE_MODE" = true ]; then
+  head -n "$SAMPLE_COUNT" "$temp_list" > "${temp_list}.sample"
+  mv "${temp_list}.sample" "$temp_list"
+  image_count=$(wc -l < "$temp_list" | tr -d ' ')
+  echo "Found $total_images images, using first $image_count for sample"
+else
+  image_count="$total_images"
+  echo "Found $image_count images"
+fi
+
+if [ "$image_count" -eq 0 ]; then
+  echo "Error: No images found in $INPUT_DIR"
+  rm "$temp_list"
+  exit 1
+fi
+
+# Generate JSON
+temp_json=$(mktemp)
+echo "📝 Generating slideshow configuration..."
+echo "{" > "$temp_json"
+echo '  "slides": [' >> "$temp_json"
+
+first=true
+while IFS= read -r img; do
+  folder=$(basename "$(dirname "$img")")
+
+  # Remove leading number pattern (e.g., "2 - " from "2 - Jokhang - Lhassa - Sera")
+  folder=$(echo "$folder" | sed 's/^[0-9]\+ - //')
+
+  # Add comma for all but first entry
+  if [ "$first" = true ]; then
+    first=false
+  else
+    echo "," >> "$temp_json"
+  fi
+
+  # Escape quotes in folder name, file path, and font path for JSON
+  folder_escaped=$(printf '%s' "$folder" | sed 's/"/\\"/g')
+  img_escaped=$(printf '%s' "$img" | sed 's/"/\\"/g')
+  font_escaped=$(printf '%s' "$FONT_FILE" | sed 's/"/\\"/g')
+
+  # Write slide entry with minimal required fields
+  cat >> "$temp_json" << EOF
+    {
+      "file": "$img_escaped",
+      "transition": "fade",
+      "overlay_text": {
+        "title": "$folder_escaped",
+        "font_file": "$font_escaped",
+        "font_size": 20,
+        "duration": 5,
+        "offset": 0,
+        "transition_x": "left",
+        "transition_y": "bottom"
+      }
+    }
+EOF
+done < "$temp_list"
+
+echo "" >> "$temp_json"
+echo "  ]" >> "$temp_json"
+echo "}" >> "$temp_json"
+
+rm "$temp_list"
+
+# Process in batches if needed
+num_batches=$(( (image_count + BATCH_SIZE - 1) / BATCH_SIZE ))
+
+if [ "$num_batches" -eq 1 ]; then
+  echo "🎬 Processing all $image_count slides..."
+  if ! python "$KBURNS_CLI" "$OUTPUT_FILE" -S 1920x1080 -fps 24 -f "$temp_json"; then
+    echo "❌ Error processing slideshow"
+    rm "$temp_json"
+    exit 1
+  fi
+  rm "$temp_json"
+  echo "✅ Done! Created $OUTPUT_FILE"
+  exit 0
+fi
+
+# Multiple batches needed
+echo "🎬 Processing in $num_batches batches of ~$BATCH_SIZE slides each..."
+
+temp_dir=$(mktemp -d)
+batch_list="$temp_dir/concat_list.txt"
+> "$batch_list"
+
+for ((batch=0; batch<num_batches; batch++)); do
+  batch_num=$((batch+1))
+  start_idx=$((batch * BATCH_SIZE))
+  batch_json="$temp_dir/batch_${batch_num}.json"
+  batch_video="$temp_dir/batch_${batch_num}.mp4"
+
+  # Extract batch slides using jq
+  jq "{slides: .slides[$start_idx:$((start_idx + BATCH_SIZE))]}" "$temp_json" > "$batch_json"
+
+  batch_count=$(jq '.slides | length' "$batch_json")
+  echo ""
+  echo "Processing batch $batch_num/$num_batches (slides $((start_idx+1))-$((start_idx+batch_count)))..."
+
+  if ! python "$KBURNS_CLI" "$batch_video" -S 1920x1080 -fps 24 -f "$batch_json"; then
+    echo "❌ Error processing batch $batch_num"
+    rm -rf "$temp_dir" "$temp_json"
+    exit 1
+  fi
+
+  echo "file '$batch_video'" >> "$batch_list"
+done
+
+# Concatenate all batches
+echo ""
+echo "🎞️  Concatenating $num_batches batches..."
+if ffmpeg -y -f concat -safe 0 -i "$batch_list" -c copy "$OUTPUT_FILE" >/dev/null 2>&1; then
+  echo "✅ Done! Created $OUTPUT_FILE"
+  rm -rf "$temp_dir" "$temp_json"
+  exit 0
+else
+  echo "❌ Error concatenating batches"
+  rm -rf "$temp_dir" "$temp_json"
+  exit 1
+fi
