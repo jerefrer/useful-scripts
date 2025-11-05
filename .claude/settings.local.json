@@ -3,7 +3,12 @@
     "allow": [
       "Bash(./replace-color-in-pdf:*)",
       "Bash(perl -pe:*)",
-      "Bash(/tmp/check_pdf.sh:*)"
+      "Bash(/tmp/check_pdf.sh:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(chmod:*)",
+      "Bash(ulimit -n:*)",
+      "Bash(python kbvs-cli.py:*)",
+      "Bash(python /Users/jeremy/Documents/Programming/useful-scripts/kburns-slideshow/kbvs-cli.py:*)"
     ],
     "deny": [],
     "ask": []

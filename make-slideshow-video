@@ -1,0 +1,1100 @@
+#!/usr/bin/env bash
+
+# Parse options
+ESTIMATE_ONLY=false
+SAMPLE_MODE=false
+SAMPLE_COUNT=10
+AUDIO_FOLDERS=()
+AUDIO_FILES=()
+AUDIO_ARGS=()
+RESUME_DIR=""
+USING_RESUME=false
+ALLOW_TEMP_CLEANUP=true
+TEMP_BASE_DIR=""
+SLIDE_DURATION=5
+SLIDE_TIMELINE_FILE=""
+AUDIO_ONLY_SOURCE=""
+AUDIO_ONLY_OUTPUT=""
+
+KEEP_BATCH_WORKSPACE=true
+
+while [[ "$1" == --* ]]; do
+  case "$1" in
+    --sample)
+      SAMPLE_MODE=true
+      if [[ "$2" =~ ^[0-9]+$ ]]; then
+        SAMPLE_COUNT="$2"
+        shift
+      fi
+      shift
+      ;;
+    --estimate-only)
+      ESTIMATE_ONLY=true
+      shift
+      ;;
+    --audio)
+      shift
+      if [[ -z "$1" ]] || [[ "$1" == --* ]]; then
+        echo "Error: --audio requires a folder argument"
+        exit 1
+      fi
+      if [ ! -d "$1" ]; then
+        echo "Error: --audio folder not found: $1"
+        exit 1
+      fi
+      AUDIO_FOLDERS+=("$1")
+      shift
+      ;;
+    --resume-dir)
+      shift
+      if [[ -z "$1" ]] || [[ "$1" == --* ]]; then
+        echo "Error: --resume-dir requires a directory argument"
+        exit 1
+      fi
+      RESUME_DIR="$1"
+      shift
+      ;;
+    --keep-workspace)
+      KEEP_BATCH_WORKSPACE=true
+      shift
+      ;;
+    --cleanup-workspace)
+      KEEP_BATCH_WORKSPACE=false
+      shift
+      ;;
+    --audio-only)
+      shift
+      if [[ -z "$1" ]] || [[ "$1" == --* ]]; then
+        echo "Error: --audio-only requires a video file argument" >&2
+        exit 1
+      fi
+      AUDIO_ONLY_SOURCE="$1"
+      shift
+      ;;
+    --audio-only-output)
+      shift
+      if [[ -z "$1" ]] || [[ "$1" == --* ]]; then
+        echo "Error: --audio-only-output requires a path argument" >&2
+        exit 1
+      fi
+      AUDIO_ONLY_OUTPUT="$1"
+      shift
+      ;;
+    --slide-duration)
+      shift
+      if [[ -z "$1" ]] || [[ "$1" == --* ]]; then
+        echo "Error: --slide-duration requires a numeric argument"
+        exit 1
+      fi
+      if ! [[ "$1" =~ ^[0-9]+$ ]] || [ "$1" -le 0 ]; then
+        echo "Error: --slide-duration must be a positive integer (seconds)" >&2
+        exit 1
+      fi
+      SLIDE_DURATION="$1"
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
+
+if [ "$KEEP_BATCH_WORKSPACE" = true ]; then
+  ALLOW_TEMP_CLEANUP=false
+else
+  ALLOW_TEMP_CLEANUP=true
+fi
+
+INPUT_DIR="$1"
+BATCH_SIZE=100
+OUTPUT_FPS=24
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+KBURNS_CLI="$SCRIPT_DIR/kburns-slideshow/kbvs-cli.py"
+FONT_FILE="$SCRIPT_DIR/Montserrat-Regular.ttf"
+AUDIO_CACHE_ROOT="$SCRIPT_DIR/.audio-cache"
+START_TIME=$(date +%s)
+
+if [ -n "$AUDIO_ONLY_SOURCE" ]; then
+  if [ ! -f "$AUDIO_ONLY_SOURCE" ]; then
+    echo "Error: --audio-only source not found: $AUDIO_ONLY_SOURCE" >&2
+    exit 1
+  fi
+  if ! AUDIO_ONLY_SOURCE=$(cd "$(dirname "$AUDIO_ONLY_SOURCE")" && pwd)/"$(basename "$AUDIO_ONLY_SOURCE")"; then
+    echo "Error: Unable to resolve audio-only source path" >&2
+    exit 1
+  fi
+fi
+
+if [ -z "$INPUT_DIR" ] && [ -n "$AUDIO_ONLY_SOURCE" ]; then
+  INPUT_DIR="$(dirname "$AUDIO_ONLY_SOURCE")"
+fi
+
+if [ -n "$AUDIO_ONLY_OUTPUT" ]; then
+  if ! AUDIO_ONLY_OUTPUT=$(cd "$(dirname "$AUDIO_ONLY_OUTPUT")" 2>/dev/null && pwd)/"$(basename "$AUDIO_ONLY_OUTPUT")"; then
+    echo "Error: Unable to resolve --audio-only-output path: $AUDIO_ONLY_OUTPUT" >&2
+    exit 1
+  fi
+fi
+
+hash_data() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum
+  else
+    echo "Error: shasum or sha256sum is required for audio caching" >&2
+    exit 1
+  fi
+}
+
+prepare_audio_inputs() {
+  AUDIO_ARGS=()
+  AUDIO_FILES=()
+  if [ ${#AUDIO_FOLDERS[@]} -eq 0 ]; then
+    return
+  fi
+
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "Error: ffmpeg is required when using --audio" >&2
+    exit 1
+  fi
+  if ! command -v mp3gain >/dev/null 2>&1; then
+    echo "Error: mp3gain is required when using --audio" >&2
+    exit 1
+  fi
+
+  for folder in "${AUDIO_FOLDERS[@]}"; do
+    prepare_audio_folder "$folder"
+  done
+
+  if [ ${#AUDIO_FILES[@]} -eq 0 ]; then
+    echo "Error: Failed to prepare audio files" >&2
+    exit 1
+  fi
+
+  AUDIO_ARGS=(-a "${AUDIO_FILES[@]}")
+  echo "🎵 Using ${#AUDIO_FILES[@]} normalized audio track(s) from ${#AUDIO_FOLDERS[@]} folder(s)"
+}
+
+run_audio_only_mode() {
+  if [ -z "$AUDIO_ONLY_SOURCE" ]; then
+    return 1
+  fi
+
+  if [ ${#AUDIO_FOLDERS[@]} -eq 0 ]; then
+    echo "Error: --audio-only also requires at least one --audio folder for music" >&2
+    exit 1
+  fi
+
+  prepare_audio_inputs
+
+  local source="$AUDIO_ONLY_SOURCE"
+  local output="$AUDIO_ONLY_OUTPUT"
+  if [ -z "$output" ]; then
+    output="${source%.*}_with_audio.mp4"
+  fi
+
+  local work_dir
+  local cleanup_dir=""
+  if [ "$KEEP_BATCH_WORKSPACE" = true ] && [ -n "$RESUME_DIR" ]; then
+    work_dir="$RESUME_DIR"
+  else
+    work_dir=$(mktemp -d "$WORKSPACE_ROOT/audio-only-XXXXXX")
+    if [ "$KEEP_BATCH_WORKSPACE" != true ]; then
+      cleanup_dir="$work_dir"
+    fi
+  fi
+
+  echo "🎵 Mixing background music into existing video (audio-only mode)..."
+  if ! mix_background_audio "$source" "$output" "$work_dir"; then
+    echo "❌ Error mixing background audio" >&2
+    [ -n "$cleanup_dir" ] && rm -rf "$cleanup_dir"
+    exit 1
+  fi
+
+  if [ ! -s "$output" ]; then
+    echo "❌ Expected output file missing after audio-only mix: $output" >&2
+    [ -n "$cleanup_dir" ] && rm -rf "$cleanup_dir"
+    exit 1
+  fi
+
+  if [ -n "$cleanup_dir" ]; then
+    rm -rf "$cleanup_dir"
+  fi
+
+  echo "✅ Done! Created $output"
+  exit 0
+}
+
+is_video_file() {
+  local file="$1"
+  local ext=${file##*.}
+  ext=${ext,,}
+  case "$ext" in
+    mp4|mov|m4v|avi|mpg|mkv)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_image_file() {
+  local file="$1"
+  local ext=${file##*.}
+  ext=${ext,,}
+  case "$ext" in
+    jpg|jpeg|png|heic)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+print_media_runtime_breakdown() {
+  local image_count="$1"
+  local slide_duration="$2"
+  local image_runtime_fmt="$3"
+  local video_count="$4"
+  local video_runtime_fmt="$5"
+
+  echo "📊 Media runtime breakdown for estimate:"
+  if [ "$image_count" -gt 0 ]; then
+    echo "   • Images: $image_count × ${slide_duration}s per slide = $image_runtime_fmt"
+  else
+    echo "   • Images: 0 (none)"
+  fi
+
+  if [ "$video_count" -gt 0 ]; then
+    if [ -n "$video_runtime_fmt" ] && [ "$video_runtime_fmt" != "unknown" ]; then
+      echo "   • Videos: $video_count clip(s) total $video_runtime_fmt"
+    else
+      echo "   • Videos: $video_count clip(s) (duration unavailable; install ffprobe for breakdown)"
+    fi
+  else
+    echo "   • Videos: 0 (none)"
+  fi
+}
+
+cleanup_run_state() {
+  local exit_code="$1"
+  if [ -z "$TEMP_BASE_DIR" ] || [ ! -d "$TEMP_BASE_DIR" ]; then
+    return
+  fi
+  if [ "$exit_code" -eq 0 ] && [ "$ALLOW_TEMP_CLEANUP" = true ]; then
+    rm -rf "$TEMP_BASE_DIR"
+  elif [ "$exit_code" -ne 0 ]; then
+    echo "🧩 Preserving workspace at $TEMP_BASE_DIR for troubleshooting or resuming."
+  fi
+}
+
+trap 'cleanup_run_state $?' EXIT
+
+estimate_processing_seconds() {
+  local slides="${1:-0}"
+  local videos="${2:-0}"
+  local batches="${3:-1}"
+  local has_audio="${4:-0}"
+  local slide_duration="${5:-5}"
+
+  local base_time=20
+  local per_slide=1
+  local per_video=6
+
+  local slide_duration_safe="$slide_duration"
+  if [ -z "$slide_duration_safe" ] || ! [[ "$slide_duration_safe" =~ ^[0-9]+$ ]] || [ "$slide_duration_safe" -le 0 ]; then
+    slide_duration_safe=5
+  fi
+
+  local per_slide_scaled=$(( slides * per_slide * slide_duration_safe / 5 ))
+  if [ "$per_slide_scaled" -lt $((slides * per_slide / 2)) ]; then
+    per_slide_scaled=$((slides * per_slide / 2))
+  fi
+
+  local estimate=$(( base_time + per_slide_scaled + videos * per_video ))
+
+  if [ "$batches" -gt 1 ]; then
+    local extra_batches=$(( batches - 1 ))
+    estimate=$(( estimate + extra_batches * 25 ))
+  fi
+
+  if [ "$has_audio" -gt 0 ]; then
+    estimate=$(( estimate + 10 + (slides * slide_duration_safe / 10) ))
+  fi
+
+  if [ "$estimate" -lt 20 ]; then
+    estimate=20
+  fi
+
+  echo "$estimate"
+}
+
+format_duration() {
+  local total_seconds="$1"
+  if [ -z "$total_seconds" ]; then
+    echo "unknown"
+    return
+  fi
+  total_seconds=$(printf '%s' "$total_seconds" | cut -d'.' -f1)
+  if [ -z "$total_seconds" ] || ! [[ "$total_seconds" =~ ^[0-9]+$ ]]; then
+    echo "unknown"
+    return
+  fi
+  local hours=$(( total_seconds / 3600 ))
+  local minutes=$(( (total_seconds % 3600) / 60 ))
+  local seconds=$(( total_seconds % 60 ))
+  if [ "$hours" -gt 0 ]; then
+    printf '%02dh:%02dm:%02ds' "$hours" "$minutes" "$seconds"
+  else
+    printf '%02dm:%02ds' "$minutes" "$seconds"
+  fi
+}
+
+get_video_duration_seconds() {
+  local video_file="$1"
+  if [ ! -f "$video_file" ]; then
+    echo ""
+    return
+  fi
+  if ! command -v ffprobe >/dev/null 2>&1; then
+    echo ""
+    return
+  fi
+  ffprobe -v error -select_streams v:0 -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 "$video_file" 2>/dev/null | head -n 1
+}
+
+get_media_duration_seconds() {
+  local media_file="$1"
+  if [ ! -f "$media_file" ]; then
+    echo ""
+    return
+  fi
+  if ! command -v ffprobe >/dev/null 2>&1; then
+    echo ""
+    return
+  fi
+  ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$media_file" 2>/dev/null | head -n 1
+}
+
+has_audio_stream() {
+  local media_file="$1"
+  ffprobe -v error -select_streams a:0 -show_entries stream=index -of csv=p=0 "$media_file" >/dev/null 2>&1
+}
+
+mix_background_audio() {
+  local source_video="$1"
+  local target_video="$2"
+  local work_dir="$3"
+
+  local video_duration
+  video_duration=$(get_media_duration_seconds "$source_video")
+  if [ -z "$video_duration" ]; then
+    echo "❌ Unable to determine video duration for background mix" >&2
+    return 1
+  fi
+
+  local playlist_file="$work_dir/audio_playlist.txt"
+  : > "$playlist_file"
+  for track in "${AUDIO_FILES[@]}"; do
+    printf "file '%s'\n" "$track" >> "$playlist_file"
+  done
+
+  local bg_single="$work_dir/background_single.m4a"
+  if ! ffmpeg -hide_banner -loglevel error -y -f concat -safe 0 -i "$playlist_file" -c:a aac "$bg_single"; then
+    echo "❌ Error concatenating background tracks" >&2
+    return 1
+  fi
+
+  local bg_looped="$work_dir/background_looped.wav"
+  if ! ffmpeg -hide_banner -loglevel error -y -i "$bg_single" -filter_complex "aloop=-1:size=0,atrim=0:$video_duration,asetpts=PTS-STARTPTS" -c:a pcm_s16le "$bg_looped"; then
+    echo "❌ Error extending background audio" >&2
+    return 1
+  fi
+
+  local mix_filter
+  if has_audio_stream "$source_video"; then
+    mix_filter='[1:a]volume=0.35,asetpts=PTS-STARTPTS[bga];'
+    mix_filter+="[bga][0:a]sidechaincompress=threshold=0.02:ratio=20:attack=50:release=1200:level_in=1:level_sc=1[ducked];"
+    mix_filter+="[ducked][0:a]amix=inputs=2:normalize=0[aout]"
+  else
+    mix_filter='[1:a]volume=0.35,asetpts=PTS-STARTPTS[aout]'
+  fi
+
+  if ! ffmpeg -hide_banner -loglevel error -y -i "$source_video" -i "$bg_looped" -filter_complex "$mix_filter" -map 0:v -map "[aout]" -c:v copy -c:a aac "$target_video"; then
+    echo "❌ Error mixing background audio under video" >&2
+    return 1
+  fi
+
+  return 0
+}
+
+print_final_summary() {
+  local slides="$1"
+  local video_file="$2"
+  local elapsed=$(( $(date +%s) - START_TIME ))
+  local elapsed_fmt
+  elapsed_fmt=$(format_duration "$elapsed")
+  local video_secs
+  video_secs=$(get_video_duration_seconds "$video_file")
+  local video_fmt="unknown"
+  if [ -n "$video_secs" ]; then
+    video_fmt=$(format_duration "$video_secs")
+  fi
+  echo "ℹ️  Processed $slides slide(s) in $elapsed_fmt; video length $video_fmt."
+}
+
+clean_title() {
+  local title="$1"
+  local trimmed
+  trimmed=$(printf '%s' "$title" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')
+  if [[ "$trimmed" =~ ^[[:space:]]*([0-9]+)[[:space:]]*[-–—:.][[:space:]]*(.*)$ ]]; then
+    trimmed="${BASH_REMATCH[2]}"
+  fi
+  trimmed=${trimmed//\'/’}
+  printf '%s' "$trimmed"
+}
+
+estimate_video_runtime() {
+  local json_file="$1"
+  local fps="$2"
+  echo "🧮 Estimating video duration (no rendering)..."
+  local cli_output
+  if ! cli_output=$(python "$KBURNS_CLI" "$OUTPUT_FILE" -S 1920x1080 -fps "$fps" -f "$json_file" -test 2>&1); then
+    echo "❌ Error estimating duration"
+    printf '%s\n' "$cli_output"
+    return 1
+  fi
+
+  local frames
+  frames=$(printf '%s\n' "$cli_output" | grep -Eo 'Number of Frames: [0-9]+' | tail -n 1 | awk '{print $4}')
+  if [ -z "$frames" ]; then
+    echo "❌ Unable to determine frame count during estimation"
+    printf '%s\n' "$cli_output"
+    return 1
+  fi
+
+  local duration_secs
+  duration_secs=$(awk -v f="$frames" -v rate="$fps" 'BEGIN { printf "%.0f", f / rate }')
+  local duration_fmt
+  duration_fmt=$(format_duration "$duration_secs")
+
+  echo "ℹ️  Estimated video length: $duration_fmt ($frames frames @ ${fps}fps)"
+  return 0
+}
+
+file_signature() {
+  local file="$1"
+  if stat --version >/dev/null 2>&1; then
+    stat -c '%Y:%s:%n' "$file"
+  else
+    stat -f '%m:%z:%N' "$file"
+  fi
+}
+
+get_audio_bitrate() {
+  local src="$1"
+  if ! command -v ffprobe >/dev/null 2>&1; then
+    echo ""
+    return
+  fi
+  local bitrate
+  bitrate=$(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of default=noprint_wrappers=1:nokey=1 "$src" 2>/dev/null | tr -d '\r')
+  if [[ -z "$bitrate" || "$bitrate" == "N/A" ]]; then
+    echo ""
+  else
+    echo "$bitrate"
+  fi
+}
+
+prepare_audio_folder() {
+  local folder="$1"
+  local folder_abs
+  if ! folder_abs=$(cd "$folder" && pwd); then
+    echo "Error: Unable to access audio folder: $folder" >&2
+    exit 1
+  fi
+
+  mkdir -p "$AUDIO_CACHE_ROOT"
+
+  local folder_hash
+  folder_hash=$(printf '%s' "$folder_abs" | hash_data | awk '{print $1}')
+  local cache_dir="$AUDIO_CACHE_ROOT/$folder_hash"
+  local mp3_dir="$cache_dir/mp3"
+  local state_file="$cache_dir/state.sha"
+  local manifest_file="$cache_dir/processed.txt"
+
+  local audio_files=()
+  while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    audio_files+=("$file")
+  done < <(find "$folder_abs" -type f \( -iname '*.mp3' -o -iname '*.ogg' -o -iname '*.oga' -o -iname '*.flac' -o -iname '*.wav' -o -iname '*.aif' -o -iname '*.aiff' -o -iname '*.m4a' -o -iname '*.aac' -o -iname '*.wma' \) | sort)
+
+  if [ ${#audio_files[@]} -eq 0 ]; then
+    echo "Error: No audio files found in folder: $folder_abs" >&2
+    exit 1
+  fi
+
+  local state_hash
+  state_hash=$( (for file in "${audio_files[@]}"; do file_signature "$file"; done) | hash_data | awk '{print $1}')
+
+  if [ "$USING_RESUME" != true ] && [ -f "$state_file" ] && [ "$state_hash" = "$(cat "$state_file" 2>/dev/null)" ] && [ -f "$manifest_file" ]; then
+    local processed_files=()
+    local missing=""
+    while IFS= read -r processed; do
+      [ -z "$processed" ] && continue
+      processed_files+=("$processed")
+      if [ ! -f "$processed" ]; then
+        missing=1
+      fi
+    done < "$manifest_file"
+
+    if [ -z "$missing" ] && [ ${#processed_files[@]} -gt 0 ]; then
+      echo "♻️  Reusing cached audio from $folder_abs"
+      for file in "${processed_files[@]}"; do
+        AUDIO_FILES+=("$file")
+      done
+      return
+    fi
+  fi
+
+  echo "🎧 Preparing audio from $folder_abs..."
+  rm -rf "$cache_dir"
+  mkdir -p "$mp3_dir"
+
+  local processed_list=()
+  local idx=0
+  for src in "${audio_files[@]}"; do
+    idx=$((idx + 1))
+    local base
+    base=$(basename "$src")
+    local stem="${base%.*}"
+    local sanitized
+    sanitized=$(echo "$stem" | tr ' ' '_' | sed 's/[^A-Za-z0-9._-]/_/g')
+    local mp3_file="$mp3_dir/$(printf '%04d' "$idx")_${sanitized}.mp3"
+
+    case "$src" in
+      *.mp3|*.MP3)
+        if ! ffmpeg -hide_banner -loglevel error -y -i "$src" -vn -c:a copy "$mp3_file"; then
+          echo "❌ Error copying mp3 file: $src" >&2
+          exit 1
+        fi
+        ;;
+      *)
+        local bitrate
+        bitrate=$(get_audio_bitrate "$src")
+        if [ -n "$bitrate" ]; then
+          if ! ffmpeg -hide_banner -loglevel error -y -i "$src" -vn -c:a libmp3lame -b:a "$bitrate" "$mp3_file"; then
+            echo "❌ Error converting audio file: $src" >&2
+            exit 1
+          fi
+        else
+          if ! ffmpeg -hide_banner -loglevel error -y -i "$src" -vn -c:a libmp3lame -q:a 2 "$mp3_file"; then
+            echo "❌ Error converting audio file: $src" >&2
+            exit 1
+          fi
+        fi
+        ;;
+    esac
+
+    processed_list+=("$mp3_file")
+  done
+
+  if ! mp3gain -r -k "${processed_list[@]}" >/dev/null 2>&1; then
+    echo "❌ Error normalizing audio for $folder_abs" >&2
+    exit 1
+  fi
+
+  printf '%s\n' "$state_hash" > "$state_file"
+  printf '%s\n' "$folder_abs" > "$cache_dir/original_path.txt"
+  printf '%s\n' "${processed_list[@]}" > "$manifest_file"
+
+  for file in "${processed_list[@]}"; do
+    AUDIO_FILES+=("$file")
+  done
+}
+
+if [ -z "$INPUT_DIR" ]; then
+  echo "Usage: $0 [--sample [N]] [--audio FOLDER] [--estimate-only] ... <input-folder>"
+  echo ""
+  echo "Creates a Ken Burns slideshow video from all images and videos in the folder."
+  echo "Files from the same subfolder will have the same subtitle."
+  echo "Videos will play with their original audio, with background music crossfading."
+  echo ""
+  echo "Options:"
+  echo "  --sample [N]    Generate video with only first N files (default: 10)"
+  echo "                  Useful for quick preview before processing all files"
+  echo "  --audio FOLDER  Add background music from a folder of audio files"
+  echo "                  Supported formats are converted to mp3 once"
+  echo "                  mp3gain normalizes tracks so they blend together"
+  echo "                  Cache avoids reprocessing if originals are unchanged"
+  echo "  --estimate-only Only calculate final video duration, do not render"
+  echo "  --resume-dir DIR Resume a previous multi-batch run using DIR as workspace"
+  echo "  --slide-duration N Override default 5s duration per slide"
+  echo ""
+  echo "Examples:"
+  echo "  $0 ~/Downloads/Tibet"
+  echo "  → Creates Tibet.mp4 in the folder where you run this script"
+  echo ""
+  echo "  $0 --audio ~/Music/TripPlaylist ~/Downloads/Tibet"
+  echo "  → Creates slideshow with normalized background music"
+  echo ""
+  echo "  $0 --audio IntroTracks --audio OutroTracks ~/Downloads/Tibet"
+  echo "  → Mixes multiple music folders (cached per folder)"
+  echo ""
+  echo "  $0 --sample ~/Downloads/Tibet"
+  echo "  → Creates Tibet-sample.mp4 in the current folder with 10 files"
+  echo ""
+  echo "  $0 --sample 5 --audio ~/Music/song.mp3 ~/Downloads/Tibet"
+  echo "  → Creates sample with 5 files and background music"
+  echo ""
+  echo "  $0 --estimate-only ~/Downloads/Tibet"
+  echo "  → Prints estimated runtime without encoding video"
+  exit 1
+fi
+
+INPUT_ABS=$(cd "$INPUT_DIR" && pwd)
+FOLDER_NAME=$(basename "$INPUT_ABS")
+RUN_DIR=$(pwd)
+LOG_DIR="$RUN_DIR/make-slideshow-video-logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/${FOLDER_NAME}-$(date +%Y%m%d-%H%M%S).log"
+touch "$LOG_FILE"
+exec > >(tee -a "$LOG_FILE")
+exec 2>&1
+echo "📓 Detailed log: $LOG_FILE"
+
+if [ ! -f "$KBURNS_CLI" ]; then
+  echo "Error: kbvs-cli.py not found at $KBURNS_CLI"
+  echo "Please ensure kburns-slideshow is in the same directory as this script"
+  echo "If not clone the repo from https://github.com/Trekky12/kburns-slideshow"
+  exit 1
+fi
+
+if [ ! -f "$FONT_FILE" ]; then
+  echo "Error: Montserrat-Regular.ttf not found at $FONT_FILE"
+  echo "Please ensure the font file is in the same directory as this script"
+  exit 1
+fi
+
+WORKSPACE_ROOT="$RUN_DIR/make-slideshow-video-workspaces"
+mkdir -p "$WORKSPACE_ROOT"
+
+# Allow audio-only mixing shortcut before any heavy processing
+run_audio_only_mode || true
+
+if [ -n "$RESUME_DIR" ]; then
+  if [ ! -d "$RESUME_DIR" ]; then
+    echo "Error: --resume-dir path not found: $RESUME_DIR"
+    exit 1
+  fi
+  if [ ! -r "$RESUME_DIR" ] || [ ! -w "$RESUME_DIR" ]; then
+    echo "Error: --resume-dir directory must be readable and writable"
+    exit 1
+  fi
+  if ! RESUME_DIR=$(cd "$RESUME_DIR" && pwd); then
+    echo "Error: Unable to access --resume-dir: $RESUME_DIR"
+    exit 1
+  fi
+  USING_RESUME=true
+fi
+
+WORKSPACE_ROOT="$RUN_DIR/make-slideshow-video-workspaces"
+mkdir -p "$WORKSPACE_ROOT"
+
+STATE_FILE=""
+temp_json=""
+batch_list=""
+
+if [ "$USING_RESUME" = true ]; then
+  TEMP_BASE_DIR="$RESUME_DIR"
+  ALLOW_TEMP_CLEANUP=false
+  echo "🔁 Resuming from workspace: $TEMP_BASE_DIR"
+  STATE_FILE="$TEMP_BASE_DIR/state.env"
+  if [ ! -f "$STATE_FILE" ]; then
+    echo "Error: Workspace missing state file: $STATE_FILE"
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  . "$STATE_FILE"
+  if [ -n "$STATE_INPUT_ABS" ] && [ "$STATE_INPUT_ABS" != "$INPUT_ABS" ]; then
+    echo "Error: Workspace was created for $STATE_INPUT_ABS but current input is $INPUT_ABS" >&2
+    exit 1
+  fi
+  if [ -n "$STATE_OUTPUT_FILE" ]; then
+    OUTPUT_FILE="$STATE_OUTPUT_FILE"
+  fi
+  if [ -n "$STATE_BATCH_SIZE" ]; then
+    BATCH_SIZE="$STATE_BATCH_SIZE"
+  fi
+  if [ -n "$STATE_OUTPUT_FPS" ]; then
+    OUTPUT_FPS="$STATE_OUTPUT_FPS"
+  fi
+  if [ -n "$STATE_SLIDE_DURATION" ]; then
+    SLIDE_DURATION="$STATE_SLIDE_DURATION"
+  fi
+else
+  TEMP_BASE_DIR=$(mktemp -d "$WORKSPACE_ROOT/${FOLDER_NAME}-workspace-XXXXXX")
+  echo "🗂️ Workspace: $TEMP_BASE_DIR"
+  STATE_FILE="$TEMP_BASE_DIR/state.env"
+  : > "$STATE_FILE"
+fi
+
+temp_json="$TEMP_BASE_DIR/slides.json"
+BATCH_DIR="$TEMP_BASE_DIR/batches"
+mkdir -p "$BATCH_DIR"
+batch_list="$TEMP_BASE_DIR/concat_list.txt"
+
+# Set output filename based on mode (always in current working directory)
+if [ "$SAMPLE_MODE" = true ]; then
+  OUTPUT_FILE="$RUN_DIR/${FOLDER_NAME}-sample.mp4"
+else
+  OUTPUT_FILE="$RUN_DIR/${FOLDER_NAME}.mp4"
+fi
+
+if [ "$SAMPLE_MODE" = true ]; then
+  echo "🖼️ Scanning for images and videos in $INPUT_ABS (SAMPLE MODE - first $SAMPLE_COUNT files)..."
+else
+  echo "🖼️ Scanning for images and videos in $INPUT_ABS..."
+fi
+
+# Find all images and videos and sort
+temp_list=$(mktemp "$TEMP_BASE_DIR/filelist.XXXXXX")
+temp_images=$(mktemp "$TEMP_BASE_DIR/images.XXXXXX")
+temp_videos=$(mktemp "$TEMP_BASE_DIR/videos.XXXXXX")
+
+find "$INPUT_ABS" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | sort > "$temp_images"
+find "$INPUT_ABS" -type f \( -iname '*.mp4' -o -iname '*.mov' -o -iname '*.m4v' -o -iname '*.avi' -o -iname '*.mpg' -o -iname '*.mkv' \) | sort > "$temp_videos"
+
+total_images=$(wc -l < "$temp_images" | tr -d ' ')
+total_videos=$(wc -l < "$temp_videos" | tr -d ' ')
+total_files=$((total_images + total_videos))
+selected_images="$total_images"
+selected_videos="$total_videos"
+
+# Limit to sample count if in sample mode
+if [ "$SAMPLE_MODE" = true ]; then
+  if [ "$total_videos" -gt 0 ]; then
+    # Alternate between images and videos
+      > "$temp_list"
+    img_idx=1
+    vid_idx=1
+    count=0
+    while [ $count -lt "$SAMPLE_COUNT" ] && { [ $img_idx -le "$total_images" ] || [ $vid_idx -le "$total_videos" ]; }; do
+      # Add image if available
+      if [ $img_idx -le "$total_images" ]; then
+        sed -n "${img_idx}p" "$temp_images" >> "$temp_list"
+        img_idx=$((img_idx + 1))
+        count=$((count + 1))
+        [ $count -ge "$SAMPLE_COUNT" ] && break
+      fi
+      # Add video if available
+      if [ $vid_idx -le "$total_videos" ]; then
+        sed -n "${vid_idx}p" "$temp_videos" >> "$temp_list"
+        vid_idx=$((vid_idx + 1))
+        count=$((count + 1))
+      fi
+    done
+  else
+    # No videos, just use images
+    echo "   Found $total_images images, using first $SAMPLE_COUNT for sample"
+    head -n "$SAMPLE_COUNT" "$temp_images" > "$temp_list"
+  fi
+  image_count=$(wc -l < "$temp_list" | tr -d ' ')
+else
+  # Combine all files
+  cat "$temp_images" "$temp_videos" | sort > "$temp_list"
+  image_count="$total_files"
+fi
+
+rm "$temp_images" "$temp_videos"
+
+if [ -s "$temp_list" ]; then
+  selected_videos=$(grep -Ei '\.(mp4|mov|m4v|avi|mpg|mkv)$' "$temp_list" | wc -l | tr -d ' ')
+else
+  selected_videos=0
+fi
+selected_images=$(( image_count - selected_videos ))
+if [ "$selected_images" -lt 0 ]; then
+  selected_images=0
+fi
+image_runtime_secs=$(( selected_images * SLIDE_DURATION ))
+image_runtime_fmt=$(format_duration "$image_runtime_secs")
+if [ "$selected_images" -gt 0 ]; then
+  echo "🖼️ Images: $selected_images × ${SLIDE_DURATION}s per slide = $image_runtime_fmt total"
+else
+  echo "🖼️ Images: 0 (no stills selected)"
+fi
+
+selected_video_runtime_secs=""
+video_runtime_fmt=""
+if [ "$selected_videos" -gt 0 ] && command -v ffprobe >/dev/null 2>&1; then
+  selected_video_runtime_secs=0
+  while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    if [[ "$entry" =~ \.(mp4|mov|m4v|avi|mpg|mkv)$ ]]; then
+      duration_raw=$(get_video_duration_seconds "$entry")
+      if [ -n "$duration_raw" ]; then
+        duration_int=$(awk -v d="$duration_raw" 'BEGIN { printf "%.0f", d }')
+        selected_video_runtime_secs=$(( selected_video_runtime_secs + duration_int ))
+      fi
+    fi
+  done < "$temp_list"
+  video_runtime_fmt=$(format_duration "$selected_video_runtime_secs")
+fi
+if [ -n "$video_runtime_fmt" ]; then
+  echo "🎬 Videos: $selected_videos clip(s) total $video_runtime_fmt (source duration)"
+else
+  echo "🎬 Videos: $selected_videos clip(s)"
+fi
+
+if [ "$image_count" -eq 0 ]; then
+  echo "   Error: No images or videos found in $INPUT_DIR"
+  rm "$temp_list"
+  exit 1
+fi
+
+if [ "$ESTIMATE_ONLY" = true ]; then
+  total_runtime_secs=$(( image_runtime_secs + ${selected_video_runtime_secs:-0} ))
+  total_runtime_fmt=$(format_duration "$total_runtime_secs")
+  echo "🧮 Estimated video length: $total_runtime_fmt (stills + source videos)"
+  rm "$temp_list"
+  exit 0
+fi
+
+# Generate or reuse JSON
+if [ "$USING_RESUME" = true ]; then
+  echo "🔁 Reusing existing slide configuration at $temp_json"
+else
+  echo "📝 Generating slideshow configuration..."
+  echo "{" > "$temp_json"
+  echo '  "slides": [' >> "$temp_json"
+
+  cat <<EOF > "$STATE_FILE"
+STATE_INPUT_ABS="$INPUT_ABS"
+STATE_OUTPUT_FILE="$OUTPUT_FILE"
+STATE_BATCH_SIZE="$BATCH_SIZE"
+STATE_OUTPUT_FPS="$OUTPUT_FPS"
+STATE_SLIDE_DURATION="$SLIDE_DURATION"
+EOF
+
+  first=true
+  while IFS= read -r img; do
+    folder=$(basename "$(dirname "$img")")
+
+    folder=$(clean_title "$folder")
+
+    # Add comma for all but first entry
+    if [ "$first" = true ]; then
+      first=false
+    else
+      echo "," >> "$temp_json"
+    fi
+
+    # Escape quotes in folder name, file path, and font path for JSON
+    folder_escaped=$(printf '%s' "$folder" | sed 's/"/\\"/g')
+    img_escaped=$(printf '%s' "$img" | sed 's/"/\\"/g')
+    font_escaped=$(printf '%s' "$FONT_FILE" | sed 's/"/\\"/g')
+
+    # Write slide entry with minimal required fields
+    cat >> "$temp_json" << EOF
+    {
+      "file": "$img_escaped",
+      "transition": "fade",
+      "slide_duration": $SLIDE_DURATION,
+      "overlay_text": {
+        "title": "$folder_escaped",
+        "font_file": "$font_escaped",
+        "font_size": 32,
+        "duration": $SLIDE_DURATION,
+        "offset": 0,
+        "transition_x": "left",
+        "transition_y": "bottom"
+      }
+    }
+EOF
+  done < "$temp_list"
+
+  echo "" >> "$temp_json"
+  echo "  ]" >> "$temp_json"
+  echo "}" >> "$temp_json"
+fi
+
+rm "$temp_list"
+
+# Process in batches if needed
+num_batches=$(( (image_count + BATCH_SIZE - 1) / BATCH_SIZE ))
+
+if [ "$ESTIMATE_ONLY" != true ]; then
+  has_audio_flag=0
+  if [ ${#AUDIO_FOLDERS[@]} -gt 0 ]; then
+    has_audio_flag=1
+  fi
+  estimate_secs=$(estimate_processing_seconds "$image_count" "$selected_videos" "$num_batches" "$has_audio_flag" "$SLIDE_DURATION")
+  estimate_fmt=$(format_duration "$estimate_secs")
+  audio_note=""
+  if [ "$has_audio_flag" -gt 0 ]; then
+    audio_note=", background audio enabled"
+  fi
+  printf '⌛ Rough processing estimate: ~%s (slides: %s, batches: %s%s).\n' "$estimate_fmt" "$image_count" "$num_batches" "$audio_note"
+  if [ -t 0 ]; then
+    if ! read -t 10 -r -p "Proceed with rendering? [Y/n] (auto-continue in 10s): " user_choice; then
+      echo ""
+      echo "⏱️  No response within 10 seconds; continuing automatically."
+    else
+      echo ""
+      if [[ "$user_choice" =~ ^([Nn]|[Nn][Oo])$ ]]; then
+        echo "⏹️  Rendering cancelled by user."
+        rm "$temp_json"
+        exit 0
+      fi
+    fi
+  else
+    echo "  Non-interactive mode detected; starting immediately."
+  fi
+fi
+
+# Build audio arguments array (only when rendering)
+AUDIO_ARGS=()
+if [ ${#AUDIO_FOLDERS[@]} -gt 0 ]; then
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "Error: ffmpeg is required when using --audio" >&2
+    rm "$temp_json"
+    exit 1
+  fi
+  if ! command -v mp3gain >/dev/null 2>&1; then
+    echo "Error: mp3gain is required when using --audio" >&2
+    rm "$temp_json"
+    exit 1
+  fi
+
+  for folder in "${AUDIO_FOLDERS[@]}"; do
+    prepare_audio_folder "$folder"
+  done
+
+  if [ ${#AUDIO_FILES[@]} -eq 0 ]; then
+    echo "Error: Failed to prepare audio files" >&2
+    rm "$temp_json"
+    exit 1
+  fi
+
+  AUDIO_ARGS=(-a "${AUDIO_FILES[@]}")
+  echo "🎵 Using ${#AUDIO_FILES[@]} normalized audio track(s) from ${#AUDIO_FOLDERS[@]} folder(s)"
+fi
+
+if [ "$num_batches" -eq 1 ]; then
+  echo "🎬 Processing all $image_count slides..."
+  if ! python "$KBURNS_CLI" "$OUTPUT_FILE" -S 1920x1080 --temp -fps "$OUTPUT_FPS" -f "$temp_json" "${AUDIO_ARGS[@]}"; then
+    echo "❌ Error processing slideshow"
+    rm "$temp_json"
+    exit 1
+  fi
+  if [ ! -s "$OUTPUT_FILE" ]; then
+    echo "❌ Expected output file missing after render: $OUTPUT_FILE"
+    rm "$temp_json"
+    exit 1
+  fi
+  rm "$temp_json"
+  echo "✅ Done! Created $OUTPUT_FILE"
+  print_final_summary "$image_count" "$OUTPUT_FILE"
+  exit 0
+fi
+
+# Multiple batches needed
+echo "🎬 Processing in $num_batches batches of ~$BATCH_SIZE slides each..."
+
+temp_dir="$BATCH_DIR"
+mkdir -p "$temp_dir"
+batch_list="$temp_dir/concat_list.txt"
+if [ "$USING_RESUME" = true ] && [ -f "$batch_list" ]; then
+  echo "🔁 Reusing existing batch list at $batch_list"
+else
+> "$batch_list"
+fi
+
+for ((batch=0; batch<num_batches; batch++)); do
+  batch_num=$((batch+1))
+  start_idx=$((batch * BATCH_SIZE))
+  batch_json="$temp_dir/batch_${batch_num}.json"
+  batch_video="$temp_dir/batch_${batch_num}.mp4"
+
+  # Extract batch slides using jq
+  jq "{slides: .slides[$start_idx:$((start_idx + BATCH_SIZE))]}" "$temp_json" > "$batch_json"
+
+  batch_count=$(jq '.slides | length' "$batch_json")
+  echo ""
+  echo "Processing batch $batch_num/$num_batches (slides $((start_idx+1))-$((start_idx+batch_count)))..."
+
+  if [ "$USING_RESUME" = true ] && [ -s "$batch_video" ]; then
+    if grep -q "batch_${batch_num}\.mp4" "$batch_list" 2>/dev/null; then
+      echo "↩️  Batch $batch_num already rendered; skipping."
+      continue
+    fi
+    echo "↩️  Batch $batch_num already rendered; reusing output."
+    echo "file '$batch_video'" >> "$batch_list"
+    continue
+  fi
+
+  if ! python "$KBURNS_CLI" "$batch_video" -S 1920x1080 -fps "$OUTPUT_FPS" -f "$batch_json"; then
+    echo "❌ Error processing batch $batch_num"
+    exit 1
+  fi
+  if [ ! -s "$batch_video" ]; then
+    echo "❌ Batch $batch_num expected output not found: $batch_video"
+    exit 1
+  fi
+
+  echo "file '$batch_video'" >> "$batch_list"
+done
+
+# Concatenate all batches
+echo ""
+echo "🎞️  Concatenating $num_batches batches..."
+
+# If audio files are provided, we need to add them after concatenation
+temp_no_audio="$temp_dir/video_no_audio.mp4"
+echo "🔗 ffmpeg concat command: ffmpeg -y -f concat -safe 0 -i $batch_list -c copy $temp_no_audio"
+if ! ffmpeg -y -f concat -safe 0 -i "$batch_list" -c copy "$temp_no_audio"; then
+  echo "❌ Error concatenating batches"
+  rm "$temp_json"
+  exit 1
+fi
+
+if [ ${#AUDIO_FILES[@]} -gt 0 ]; then
+  echo "🎵 Mixing background music under concatenated video via ffmpeg"
+  mixed_output="$temp_dir/video_with_audio.mp4"
+  if ! mix_background_audio "$temp_no_audio" "$mixed_output" "$temp_dir"; then
+    echo "❌ Error mixing background audio"
+    rm "$temp_json"
+    exit 1
+  fi
+  if ! mv "$mixed_output" "$OUTPUT_FILE"; then
+    echo "❌ Failed to finalize mixed output"
+    rm "$temp_json"
+    exit 1
+  fi
+else
+  if ! mv "$temp_no_audio" "$OUTPUT_FILE"; then
+    echo "❌ Failed to finalize concatenated output"
+    rm "$temp_json"
+    exit 1
+  fi
+fi
+
+if [ ! -s "$OUTPUT_FILE" ]; then
+  echo "❌ Expected output file missing after final assembly: $OUTPUT_FILE"
+  rm "$temp_json"
+  exit 1
+fi
+
+rm -f "$batch_list"
+rm -f "$temp_dir"/batch_*.json "$temp_dir"/batch_*.mp4
+rm -f "$temp_dir"/audio_playlist.txt "$temp_dir"/background_single.m4a "$temp_dir"/background_looped.wav
+
+echo "✅ Done! Created $OUTPUT_FILE"
+print_final_summary "$image_count" "$OUTPUT_FILE"
+rm "$temp_json"
+exit 0

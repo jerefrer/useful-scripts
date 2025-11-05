@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SAMPLE_MODE=false
+SAMPLE_COUNT=10
+SLIDE_DURATION=5
+OUTPUT_FPS=24
+AUDIO_FOLDERS=()
+AUDIO_FILES=()
+AUDIO_ARGS=()
+
+while [[ "$1" == --* ]]; do
+  case "$1" in
+    --sample)
+      SAMPLE_MODE=true
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+        SAMPLE_COUNT="$2"
+        shift
+      fi
+      shift
+      ;;
+    --slide-duration)
+      shift
+      if [[ -z "${1:-}" ]] || [[ "$1" == --* ]]; then
+        echo "Error: --slide-duration requires a numeric argument" >&2
+        exit 1
+      fi
+      if ! [[ "$1" =~ ^[0-9]+$ ]] || [ "$1" -le 0 ]; then
+        echo "Error: --slide-duration must be a positive integer (seconds)" >&2
+        exit 1
+      fi
+      SLIDE_DURATION="$1"
+      shift
+      ;;
+    --audio)
+      shift
+      if [[ -z "${1:-}" ]] || [[ "$1" == --* ]]; then
+        echo "Error: --audio requires a folder argument" >&2
+        exit 1
+      fi
+      if [ ! -d "$1" ]; then
+        echo "Error: --audio folder not found: $1" >&2
+        exit 1
+      fi
+      AUDIO_FOLDERS+=("$1")
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [ $# -lt 1 ]; then
+  echo "Usage: $0 [--sample [N]] [--slide-duration N] [--audio FOLDER] <input-folder>" >&2
+  exit 1
+fi
+
+INPUT_DIR="$1"
+shift || true
+
+if [ ! -d "$INPUT_DIR" ]; then
+  echo "Error: Input folder not found: $INPUT_DIR" >&2
+  exit 1
+fi
+
+RUN_DIR=$(pwd)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+KBURNS_CLI="$SCRIPT_DIR/kburns-slideshow/kbvs-cli.py"
+FONT_FILE="$SCRIPT_DIR/Montserrat-Regular.ttf"
+AUDIO_CACHE_ROOT="$SCRIPT_DIR/.audio-cache"
+
+if [ ! -f "$KBURNS_CLI" ]; then
+  echo "Error: kbvs-cli.py not found at $KBURNS_CLI" >&2
+  exit 1
+fi
+
+if [ ! -f "$FONT_FILE" ]; then
+  echo "Error: Montserrat-Regular.ttf not found at $FONT_FILE" >&2
+  exit 1
+fi
+
+if [ ${#AUDIO_FOLDERS[@]} -gt 0 ]; then
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "Error: ffmpeg is required when using --audio" >&2
+    exit 1
+  fi
+  if ! command -v mp3gain >/dev/null 2>&1; then
+    echo "Error: mp3gain is required when using --audio" >&2
+    exit 1
+  fi
+fi
+
+hash_data() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256
+  elif command -v sha256sum >/devnull 2>&1; then
+    sha256sum
+  else
+    echo "Error: shasum or sha256sum is required" >&2
+    exit 1
+  fi
+}
+
+file_signature() {
+  local file="$1"
+  if stat --version >/dev/null 2>&1; then
+    stat -c '%Y:%s:%n' "$file"
+  else
+    stat -f '%m:%z:%N' "$file"
+  fi
+}
+
+prepare_audio_folder() {
+  local folder="$1"
+  local folder_abs
+  if ! folder_abs=$(cd "$folder" && pwd); then
+    echo "Error: Unable to access audio folder: $folder" >&2
+    exit 1
+  fi
+
+  mkdir -p "$AUDIO_CACHE_ROOT"
+
+  local folder_hash
+  folder_hash=$(printf '%s' "$folder_abs" | hash_data | awk '{print $1}')
+  local cache_dir="$AUDIO_CACHE_ROOT/$folder_hash"
+  local mp3_dir="$cache_dir/mp3"
+  local state_file="$cache_dir/state.sha"
+  local manifest_file="$cache_dir/processed.txt"
+
+  local audio_files=()
+  while IFS= read -r mp3_path; do
+    [ -z "$mp3_path" ] && continue
+    audio_files+=("$mp3_path")
+  done < <(find "$folder_abs" -type f -iname '*.mp3' | sort)
+
+  if [ ${#audio_files[@]} -eq 0 ]; then
+    echo "Error: No mp3 files found in $folder_abs" >&2
+    exit 1
+  fi
+
+  local state_hash
+  state_hash=$( (for file in "${audio_files[@]}"; do file_signature "$file"; done) | hash_data | awk '{print $1}')
+
+  if [ -f "$state_file" ] && [ "$state_hash" = "$(cat "$state_file" 2>/dev/null)" ] && [ -f "$manifest_file" ]; then
+    local processed_files=()
+    local missing=""
+    while IFS= read -r processed; do
+      [ -z "$processed" ] && continue
+      processed_files+=("$processed")
+      if [ ! -f "$processed" ]; then
+        missing=1
+      fi
+    done < "$manifest_file"
+
+    if [ -z "$missing" ] && [ ${#processed_files[@]} -gt 0 ]; then
+      echo "♻️  Reusing normalized audio from $folder_abs"
+      AUDIO_FILES+=("${processed_files[@]}")
+      return
+    fi
+  fi
+
+  rm -rf "$cache_dir"
+  mkdir -p "$mp3_dir"
+
+  local processed_list=()
+  local idx=0
+  for src in "${audio_files[@]}"; do
+    idx=$((idx + 1))
+    local base
+    base=$(basename "$src")
+    local stem="${base%.*}"
+    local sanitized
+    sanitized=$(echo "$stem" | tr ' ' '_' | sed 's/[^A-Za-z0-9._-]/_/g')
+    local mp3_file="$mp3_dir/$(printf '%04d' "$idx")_${sanitized}.mp3"
+    cp "$src" "$mp3_file"
+    processed_list+=("$mp3_file")
+  done
+
+  if ! mp3gain -r -k "${processed_list[@]}" >/dev/null 2>&1; then
+    echo "Error: mp3gain normalization failed for $folder_abs" >&2
+    exit 1
+  fi
+
+  printf '%s' "$state_hash" > "$state_file"
+  printf '%s\n' "${processed_list[@]}" > "$manifest_file"
+  AUDIO_FILES+=("${processed_list[@]}")
+}
+
+prepare_audio_inputs() {
+  if [ ${#AUDIO_FOLDERS[@]} -eq 0 ]; then
+    return
+  fi
+
+  AUDIO_FILES=()
+  for folder in "${AUDIO_FOLDERS[@]}"; do
+    prepare_audio_folder "$folder"
+  done
+
+  AUDIO_ARGS=(-a "${AUDIO_FILES[@]}")
+  echo "🎵 Using ${#AUDIO_FILES[@]} normalized track(s) from ${#AUDIO_FOLDERS[@]} folder(s)"
+}
+
+clean_title() {
+  local title="$1"
+  local trimmed
+  trimmed=$(printf '%s' "$title" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')
+  if [[ "$trimmed" =~ ^[[:space:]]*([0-9]+)[[:space:]]*[-–—:.][[:space:]]*(.*)$ ]]; then
+    trimmed="${BASH_REMATCH[2]}"
+  fi
+  trimmed=${trimmed//\'/’}
+  printf '%s' "$trimmed"
+}
+
+INPUT_ABS=$(cd "$INPUT_DIR" && pwd)
+FOLDER_NAME=$(basename "$INPUT_ABS")
+OUTPUT_FILE="$RUN_DIR/${FOLDER_NAME}.mp4"
+if [ "$SAMPLE_MODE" = true ]; then
+  OUTPUT_FILE="$RUN_DIR/${FOLDER_NAME}-sample.mp4"
+fi
+
+TEMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TEMP_DIR"' EXIT
+
+temp_json="$TEMP_DIR/slides.json"
+temp_list=$(mktemp "$TEMP_DIR/filelist.XXXXXX")
+temp_images=$(mktemp "$TEMP_DIR/images.XXXXXX")
+temp_videos=$(mktemp "$TEMP_DIR/videos.XXXXXX")
+
+find "$INPUT_ABS" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | sort > "$temp_images"
+find "$INPUT_ABS" -type f \( -iname '*.mp4' -o -iname '*.mov' -o -iname '*.m4v' -o -iname '*.avi' -o -iname '*.mpg' -o -iname '*.mkv' \) | sort > "$temp_videos"
+
+total_images=$(wc -l < "$temp_images" | tr -d ' ')
+total_videos=$(wc -l < "$temp_videos" | tr -d ' ')
+
+total_files=$((total_images + total_videos))
+imagelist_target="$temp_list"
+
+if [ "$SAMPLE_MODE" = true ]; then
+  echo "🖼️ Building sample with first $SAMPLE_COUNT items..."
+  > "$temp_list"
+  img_idx=1
+  vid_idx=1
+  count=0
+  while [ $count -lt "$SAMPLE_COUNT" ] && { [ $img_idx -le "$total_images" ] || [ $vid_idx -le "$total_videos" ]; }; do
+    if [ $img_idx -le "$total_images" ]; then
+      sed -n "${img_idx}p" "$temp_images" >> "$temp_list"
+      img_idx=$((img_idx + 1))
+      count=$((count + 1))
+      [ $count -ge "$SAMPLE_COUNT" ] && break
+    fi
+    if [ $vid_idx -le "$total_videos" ]; then
+      sed -n "${vid_idx}p" "$temp_videos" >> "$temp_list"
+      vid_idx=$((vid_idx + 1))
+      count=$((count + 1))
+    fi
+  done
+else
+  cat "$temp_images" "$temp_videos" | sort > "$temp_list"
+fi
+
+rm "$temp_images" "$temp_videos"
+
+if [ ! -s "$temp_list" ]; then
+  echo "Error: No media found in $INPUT_DIR" >&2
+  exit 1
+fi
+
+image_count=$(grep -viE '\.(mp4|mov|m4v|avi|mpg|mkv)$' "$temp_list" | wc -l | tr -d ' ')
+video_count=$(grep -iE '\.(mp4|mov|m4v|avi|mpg|mkv)$' "$temp_list" | wc -l | tr -d ' ')
+
+echo "🖼️ Images: $image_count"
+echo "🎬 Videos: $video_count"
+
+echo '{"slides":[' > "$temp_json"
+first=true
+while IFS= read -r path; do
+  [ -z "$path" ] && continue
+  folder=$(basename "$(dirname "$path")")
+  folder=$(clean_title "$folder")
+  [ "$first" = true ] && first=false || echo ',' >> "$temp_json"
+
+  esc_path=$(printf '%s' "$path" | sed 's/"/\\"/g')
+  esc_folder=$(printf '%s' "$folder" | sed 's/"/\\"/g')
+  esc_font=$(printf '%s' "$FONT_FILE" | sed 's/"/\\"/g')
+
+  cat >> "$temp_json" <<EOF
+  {
+    "file": "$esc_path",
+    "transition": "fade",
+    "slide_duration": $SLIDE_DURATION,
+    "overlay_text": {
+      "title": "$esc_folder",
+      "font_file": "$esc_font",
+      "font_size": 32,
+      "duration": $SLIDE_DURATION,
+      "offset": 0,
+      "transition_x": "left",
+      "transition_y": "bottom"
+    }
+  }
+EOF
+
+done < "$temp_list"
+
+echo ']}' >> "$temp_json"
+
+prepare_audio_inputs
+
+echo "🎬 Rendering slideshow via kbvs-cli.py..."
+if ! python "$KBURNS_CLI" "$OUTPUT_FILE" -S 1920x1080 --temp -fps "$OUTPUT_FPS" -f "$temp_json" "${AUDIO_ARGS[@]}"; then
+  echo "Error: kbvs-cli rendering failed" >&2
+  exit 1
+fi
+
+if [ ! -s "$OUTPUT_FILE" ]; then
+  echo "Error: Output file missing: $OUTPUT_FILE" >&2
+  exit 1
+fi
+
+echo "✅ Done! Created $OUTPUT_FILE"
