@@ -110,6 +110,16 @@ print_final_summary() {
   echo "ℹ️  Processed $slides slide(s) in $elapsed_fmt; video length $video_fmt."
 }
 
+clean_title() {
+  local title="$1"
+  local trimmed
+  trimmed=$(printf '%s' "$title" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')
+  if [[ "$trimmed" =~ ^[[:space:]]*([0-9]+)[[:space:]]*[-–—:.][[:space:]]*(.*)$ ]]; then
+    trimmed="${BASH_REMATCH[2]}"
+  fi
+  printf '%s' "$trimmed"
+}
+
 estimate_video_runtime() {
   local json_file="$1"
   local fps="$2"
@@ -287,7 +297,7 @@ if [ -z "$INPUT_DIR" ]; then
   echo ""
   echo "Examples:"
   echo "  $0 ~/Downloads/Tibet"
-  echo "  → Creates ~/Downloads/Tibet/Tibet.mp4 with all images and videos"
+  echo "  → Creates Tibet.mp4 in the folder where you run this script"
   echo ""
   echo "  $0 --audio ~/Music/TripPlaylist ~/Downloads/Tibet"
   echo "  → Creates slideshow with normalized background music"
@@ -296,7 +306,7 @@ if [ -z "$INPUT_DIR" ]; then
   echo "  → Mixes multiple music folders (cached per folder)"
   echo ""
   echo "  $0 --sample ~/Downloads/Tibet"
-  echo "  → Creates ~/Downloads/Tibet/Tibet-sample.mp4 with 10 files"
+  echo "  → Creates Tibet-sample.mp4 in the current folder with 10 files"
   echo ""
   echo "  $0 --sample 5 --audio ~/Music/song.mp3 ~/Downloads/Tibet"
   echo "  → Creates sample with 5 files and background music"
@@ -305,6 +315,17 @@ if [ -z "$INPUT_DIR" ]; then
   echo "  → Prints estimated runtime without encoding video"
   exit 1
 fi
+
+INPUT_ABS=$(cd "$INPUT_DIR" && pwd)
+FOLDER_NAME=$(basename "$INPUT_ABS")
+RUN_DIR=$(pwd)
+LOG_DIR="$RUN_DIR/make-slideshow-video-logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/${FOLDER_NAME}-$(date +%Y%m%d-%H%M%S).log"
+touch "$LOG_FILE"
+exec > >(tee -a "$LOG_FILE")
+exec 2>&1
+echo "📓 Detailed log: $LOG_FILE"
 
 if [ ! -f "$KBURNS_CLI" ]; then
   echo "Error: kbvs-cli.py not found at $KBURNS_CLI"
@@ -348,15 +369,11 @@ if [ ${#AUDIO_FOLDERS[@]} -gt 0 ]; then
   fi
 fi
 
-# Get absolute paths
-INPUT_ABS=$(cd "$INPUT_DIR" && pwd)
-FOLDER_NAME=$(basename "$INPUT_ABS")
-
-# Set output filename based on mode
+# Set output filename based on mode (always in current working directory)
 if [ "$SAMPLE_MODE" = true ]; then
-  OUTPUT_FILE="$INPUT_ABS/${FOLDER_NAME}-sample.mp4"
+  OUTPUT_FILE="$RUN_DIR/${FOLDER_NAME}-sample.mp4"
 else
-  OUTPUT_FILE="$INPUT_ABS/${FOLDER_NAME}.mp4"
+  OUTPUT_FILE="$RUN_DIR/${FOLDER_NAME}.mp4"
 fi
 
 if [ "$SAMPLE_MODE" = true ]; then
@@ -432,8 +449,7 @@ first=true
 while IFS= read -r img; do
   folder=$(basename "$(dirname "$img")")
 
-  # Remove leading number pattern (e.g., "2 - " from "2 - Jokhang - Lhassa - Sera")
-  folder=$(echo "$folder" | sed 's/^[0-9]\+ - //')
+  folder=$(clean_title "$folder")
 
   # Add comma for all but first entry
   if [ "$first" = true ]; then
@@ -491,6 +507,11 @@ if [ "$num_batches" -eq 1 ]; then
     rm "$temp_json"
     exit 1
   fi
+  if [ ! -s "$OUTPUT_FILE" ]; then
+    echo "❌ Expected output file missing after render: $OUTPUT_FILE"
+    rm "$temp_json"
+    exit 1
+  fi
   rm "$temp_json"
   echo "✅ Done! Created $OUTPUT_FILE"
   print_final_summary "$image_count" "$OUTPUT_FILE"
@@ -519,6 +540,11 @@ for ((batch=0; batch<num_batches; batch++)); do
 
   if ! python "$KBURNS_CLI" "$batch_video" -S 1920x1080 -fps "$OUTPUT_FPS" -f "$batch_json"; then
     echo "❌ Error processing batch $batch_num"
+    rm -rf "$temp_dir" "$temp_json"
+    exit 1
+  fi
+  if [ ! -s "$batch_video" ]; then
+    echo "❌ Batch $batch_num expected output not found: $batch_video"
     rm -rf "$temp_dir" "$temp_json"
     exit 1
   fi
