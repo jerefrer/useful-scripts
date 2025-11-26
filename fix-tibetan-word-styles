@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Normalize Tibetan fonts to a single variant and set Latin text to Times New Roman."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+from typing import List, Sequence, Tuple
+
+try:
+    from docx import Document
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+except ImportError:  # pragma: no cover - CLI ergonomics only
+    print("Error: python-docx library not found.", file=sys.stderr)
+    print("Install it with: pip install python-docx", file=sys.stderr)
+    sys.exit(1)
+
+DOCX_SUFFIX = ".docx"
+TEMP_PREFIX = "~$"
+TARGET_COMPLEX_FONT = "TibetanChogyalUnicode-170221"
+LATIN_FONT = "Times New Roman"
+LATIN_FONT_ATTRS = ("w:ascii", "w:hAnsi")
+FONT_ATTRS_TO_CHECK = LATIN_FONT_ATTRS + ("w:eastAsia", "w:cs")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Normalize any TibetanChogyalUnicode* style fonts to TibetanChogyalUnicode-170221 "
+            "and ensure Latin text uses Times New Roman while complex-script fonts stay Tibetan."
+        )
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="DOCX files or folders to scan (folders processed recursively).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would change without modifying any files.",
+    )
+    return parser.parse_args()
+
+
+def collect_docx_paths(paths: Sequence[str]) -> List[Path]:
+    found: List[Path] = []
+    seen = set()
+
+    for raw_path in paths:
+        path = Path(raw_path).expanduser()
+        if not path.exists():
+            print(f"Warning: {path} does not exist, skipping.", file=sys.stderr)
+            continue
+
+        if path.is_file():
+            if _is_valid_docx(path) and path not in seen:
+                found.append(path)
+                seen.add(path)
+            elif path.suffix.lower() != DOCX_SUFFIX:
+                print(f"Warning: {path} is not a DOCX file, skipping.", file=sys.stderr)
+            continue
+
+        for docx_file in path.rglob(f"*{DOCX_SUFFIX}"):
+            if _is_valid_docx(docx_file) and docx_file not in seen:
+                found.append(docx_file)
+                seen.add(docx_file)
+
+    return sorted(found)
+
+
+def _is_valid_docx(path: Path) -> bool:
+    return (
+        path.is_file()
+        and path.suffix.lower() == DOCX_SUFFIX
+        and not path.name.startswith(TEMP_PREFIX)
+    )
+
+
+def fix_styles_in_file(doc_path: Path, dry_run: bool) -> List[Tuple[str, bool, bool]]:
+    document = Document(doc_path)
+    updated_styles: List[Tuple[str, bool, bool]] = []
+
+    for style in document.styles:
+        normalized = _normalize_tibetan_fonts(style)
+        latin_fixed = False
+
+        if _style_needs_fix(style):
+            latin_fixed = _set_latin_fonts(style)
+
+        if normalized or latin_fixed:
+            updated_styles.append((style.name, normalized, latin_fixed))
+
+    if updated_styles and not dry_run:
+        document.save(doc_path)
+
+    return updated_styles
+
+
+def _style_needs_fix(style) -> bool:
+    rfonts = _get_rfonts(style)
+    if rfonts is None:
+        return False
+
+    for attr in FONT_ATTRS_TO_CHECK:
+        if rfonts.get(qn(attr)) == TARGET_COMPLEX_FONT:
+            return True
+
+    font = getattr(style, "font", None)
+    font_name = getattr(font, "name", None)
+    return font_name == TARGET_COMPLEX_FONT
+
+
+def _set_latin_fonts(style) -> bool:
+    rfonts = _ensure_rfonts(style)
+    changed = False
+
+    for attr in LATIN_FONT_ATTRS:
+        attr_key = qn(attr)
+        if rfonts.get(attr_key) != LATIN_FONT:
+            rfonts.set(attr_key, LATIN_FONT)
+            changed = True
+
+    return changed
+
+
+def _normalize_tibetan_fonts(style) -> bool:
+    rfonts = _ensure_rfonts(style)
+    changed = False
+
+    for attr in FONT_ATTRS_TO_CHECK:
+        attr_key = qn(attr)
+        value = rfonts.get(attr_key)
+        if value and value.startswith("TibetanChogyalUnicode") and value != TARGET_COMPLEX_FONT:
+            rfonts.set(attr_key, TARGET_COMPLEX_FONT)
+            changed = True
+
+    return changed
+
+
+def _get_rfonts(style):
+    rpr = style.element.find(qn("w:rPr"))
+    if rpr is None:
+        return None
+    return rpr.find(qn("w:rFonts"))
+
+
+def _ensure_rfonts(style):
+    rpr = style.element.find(qn("w:rPr"))
+    if rpr is None:
+        rpr = OxmlElement("w:rPr")
+        style.element.append(rpr)
+
+    rfonts = rpr.find(qn("w:rFonts"))
+    if rfonts is None:
+        rfonts = OxmlElement("w:rFonts")
+        rpr.append(rfonts)
+    return rfonts
+
+
+def main() -> int:
+    args = parse_args()
+    docx_paths = collect_docx_paths(args.paths)
+    if not docx_paths:
+        print("No DOCX files found to process.", file=sys.stderr)
+        return 1
+
+    total_styles = 0
+    touched_files = 0
+    had_errors = False
+
+    for doc_path in docx_paths:
+        try:
+            updated = fix_styles_in_file(doc_path, args.dry_run)
+        except Exception as exc:  # pragma: no cover - runtime safety
+            had_errors = True
+            print(f"Error processing {doc_path}: {exc}", file=sys.stderr)
+            continue
+
+        if updated:
+            touched_files += 1
+            total_styles += len(updated)
+            status = "[DRY-RUN] " if args.dry_run else ""
+            normalized_only = [name for name, norm, latin in updated if norm and not latin]
+            latin_styles = [name for name, _, latin in updated if latin]
+            message_parts = []
+            if normalized_only:
+                message_parts.append(
+                    f"normalized Tibetan font in {len(normalized_only)} style(s): {', '.join(normalized_only)}"
+                )
+            if latin_styles:
+                message_parts.append(
+                    f"set Latin font to '{LATIN_FONT}' in {len(latin_styles)} style(s): {', '.join(latin_styles)}"
+                )
+            detail = "; ".join(message_parts)
+            print(f"{status}{doc_path}: {detail}")
+        else:
+            print(f"{doc_path}: no styles required changes")
+
+    print(
+        f"Updated {total_styles} style(s) across {touched_files} file(s)"
+        f"{' (dry-run)' if args.dry_run else ''}."
+    )
+
+    if had_errors:
+        print("Completed with errors.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

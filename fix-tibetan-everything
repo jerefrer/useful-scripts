@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Run every fix-tibetan-* helper sequentially on the same set of DOCX paths."""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+from typing import List
+
+SCRIPT_NAMES = [
+    "fix-tibetan-spaces",
+    "fix-tibetan-broken-stackings",
+]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Execute all fix-tibetan-* scripts (word styles, spaces, broken stackings) "
+            "one after another on the same DOCX files and/or folders."
+        )
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="DOCX files or folders to process (folders scanned recursively by each script).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Pass --dry-run to each script so no files are modified.",
+    )
+    return parser.parse_args()
+
+
+def ensure_script_path(script_name: str) -> Path:
+    script_path = Path(__file__).resolve().parent / script_name
+    if not script_path.exists():
+        raise FileNotFoundError(f"Required helper script not found: {script_path}")
+    if not script_path.is_file():
+        raise FileNotFoundError(f"Helper path is not a file: {script_path}")
+    return script_path
+
+
+def build_command(script_path: Path, args: argparse.Namespace) -> List[str]:
+    command = [str(script_path), *args.paths]
+    if args.dry_run:
+        command.append("--dry-run")
+    return command
+
+
+def main() -> int:
+    args = parse_args()
+    had_errors = False
+
+    for script_name in SCRIPT_NAMES:
+        try:
+            script_path = ensure_script_path(script_name)
+        except FileNotFoundError as exc:
+            had_errors = True
+            print(f"Error: {exc}", file=sys.stderr)
+            continue
+
+        command = build_command(script_path, args)
+        print(f"\n→ Running {script_name}...")
+        result = subprocess.run(command)
+        if result.returncode != 0:
+            had_errors = True
+            print(
+                f"Warning: {script_name} exited with status {result.returncode}.",
+                file=sys.stderr,
+            )
+
+    if had_errors:
+        print("Completed with errors.", file=sys.stderr)
+        return 1
+
+    print("All fix-tibetan scripts completed successfully.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

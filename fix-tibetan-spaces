@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Convert regular spaces to non-breaking spaces in Tibetan-styled paragraphs."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+from typing import List, Sequence, Tuple
+
+try:
+    from docx import Document
+except ImportError:  # pragma: no cover - CLI ergonomics only
+    print("Error: python-docx library not found.", file=sys.stderr)
+    print("Install it with: pip install python-docx", file=sys.stderr)
+    sys.exit(1)
+
+DOCX_SUFFIX = ".docx"
+TEMP_PREFIX = "~$"
+NBSP = "\u00A0"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Replace normal spaces with non-breaking spaces in every paragraph whose "
+            "style name contains 'Tibetan'. Accepts DOCX files and/or folders."
+        )
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="DOCX files or folders to scan (folders processed recursively).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would change without modifying any files.",
+    )
+    return parser.parse_args()
+
+
+def collect_docx_paths(paths: Sequence[str]) -> List[Path]:
+    found: List[Path] = []
+    seen = set()
+
+    for raw_path in paths:
+        path = Path(raw_path).expanduser()
+        if not path.exists():
+            print(f"Warning: {path} does not exist, skipping.", file=sys.stderr)
+            continue
+
+        if path.is_file():
+            if _is_valid_docx(path) and path not in seen:
+                found.append(path)
+                seen.add(path)
+            elif path.suffix.lower() != DOCX_SUFFIX:
+                print(f"Warning: {path} is not a DOCX file, skipping.", file=sys.stderr)
+            continue
+
+        for docx_file in path.rglob(f"*{DOCX_SUFFIX}"):
+            if _is_valid_docx(docx_file) and docx_file not in seen:
+                found.append(docx_file)
+                seen.add(docx_file)
+
+    return sorted(found)
+
+
+def _is_valid_docx(path: Path) -> bool:
+    return (
+        path.is_file()
+        and path.suffix.lower() == DOCX_SUFFIX
+        and not path.name.startswith(TEMP_PREFIX)
+    )
+
+
+def process_file(doc_path: Path, dry_run: bool) -> Tuple[int, int]:
+    document = Document(doc_path)
+    modified_paragraphs = 0
+    replaced_spaces = 0
+
+    for paragraph in document.paragraphs:
+        if not _has_tibetan_style(paragraph):
+            continue
+        changed, replacements = _replace_spaces_in_paragraph(paragraph)
+        if changed:
+            modified_paragraphs += 1
+            replaced_spaces += replacements
+
+    if modified_paragraphs and not dry_run:
+        document.save(doc_path)
+
+    return modified_paragraphs, replaced_spaces
+
+
+def _has_tibetan_style(paragraph) -> bool:
+    style = getattr(paragraph, "style", None)
+    name = getattr(style, "name", "") or ""
+    return "tibetan" in name.lower()
+
+
+def _replace_spaces_in_paragraph(paragraph) -> Tuple[bool, int]:
+    changed = False
+    replacements = 0
+
+    for run in paragraph.runs:
+        text = run.text
+        if not text or " " not in text:
+            continue
+        new_text = text.replace(" ", NBSP)
+        if new_text != text:
+            replacements += text.count(" ")
+            run.text = new_text
+            changed = True
+
+    return changed, replacements
+
+
+def main() -> int:
+    args = parse_args()
+    docx_paths = collect_docx_paths(args.paths)
+    if not docx_paths:
+        print("No DOCX files found to process.", file=sys.stderr)
+        return 1
+
+    total_paragraphs = 0
+    total_spaces = 0
+    touched_files = 0
+    had_errors = False
+
+    for doc_path in docx_paths:
+        try:
+            modified, replacements = process_file(doc_path, args.dry_run)
+        except Exception as exc:  # pragma: no cover - runtime safety
+            had_errors = True
+            print(f"Error processing {doc_path}: {exc}", file=sys.stderr)
+            continue
+
+        if modified:
+            touched_files += 1
+            total_paragraphs += modified
+            total_spaces += replacements
+            status = "[DRY-RUN] " if args.dry_run else ""
+            print(
+                f"{status}{doc_path}: replaced {replacements} space(s) across "
+                f"{modified} Tibetan paragraph(s)"
+            )
+        else:
+            print(f"{doc_path}: no Tibetan paragraphs needed changes")
+
+    print(
+        f"Updated {total_paragraphs} paragraph(s) and {total_spaces} space(s) "
+        f"across {touched_files} file(s){' (dry-run)' if args.dry_run else ''}."
+    )
+
+    if had_errors:
+        print("Completed with errors.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
