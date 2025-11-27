@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Pipeline runner to prep Tibetan prayer texts: rename styles, fix formatting, add phonetics."""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+from typing import List
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+RENAME_SCRIPT = SCRIPT_DIR / "rename-styles-in-docx"
+FIX_ALL_SCRIPT = SCRIPT_DIR / "fix-tibetan-everything"
+PHONETICS_SCRIPT = SCRIPT_DIR / "generate-phonetics"
+STYLE_CSV = SCRIPT_DIR / "styles-replacement.csv"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Rename DOCX styles using styles-replacement.csv, run all fix-tibetan tools, "
+            "then generate phonetics for Tibetan verses."
+        )
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="DOCX files or folders to process (folders scanned recursively by each step).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview changes: passes --dry-run to rename/fix steps and prints phonetics command only.",
+    )
+    return parser.parse_args()
+
+
+def ensure_file(path: Path, description: str) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"Required {description} missing: {path}")
+    if not path.is_file():
+        raise FileNotFoundError(f"{description} is not a file: {path}")
+
+
+def build_command(executable: Path, args: argparse.Namespace, extra: List[str] | None = None) -> List[str]:
+    command = [str(executable)]
+    if extra:
+        command.extend(extra)
+    command.extend(args.paths)
+    return command
+
+
+def main() -> int:
+    args = parse_args()
+
+    try:
+        ensure_file(RENAME_SCRIPT, "rename-styles-in-docx script")
+        ensure_file(FIX_ALL_SCRIPT, "fix-tibetan-everything script")
+        ensure_file(PHONETICS_SCRIPT, "generate-phonetics script")
+        ensure_file(STYLE_CSV, "styles-replacement CSV")
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    had_errors = False
+
+    rename_command = build_command(
+        RENAME_SCRIPT,
+        args,
+        extra=["--mapping-csv", str(STYLE_CSV)] + (["--dry-run"] if args.dry_run else []),
+    )
+    if subprocess.run(rename_command).returncode != 0:
+        had_errors = True
+
+    fix_command = build_command(
+        FIX_ALL_SCRIPT,
+        args,
+        extra=["--dry-run"] if args.dry_run else None,
+    )
+    if subprocess.run(fix_command).returncode != 0:
+        had_errors = True
+
+    if args.dry_run:
+        phonetics_preview = build_command(PHONETICS_SCRIPT, args)
+        print("[DRY-RUN] Would execute:", " ".join(phonetics_preview))
+    else:
+        if subprocess.run(build_command(PHONETICS_SCRIPT, args)).returncode != 0:
+            had_errors = True
+
+    if had_errors:
+        print("Pipeline completed with errors.", file=sys.stderr)
+        return 1
+
+    print("Prayer text preparation completed successfully.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

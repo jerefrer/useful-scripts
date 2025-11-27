@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Remove duplicate Word styles that share the same name across DOCX files."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Sequence
+
+try:
+    from docx import Document
+except ImportError:  # pragma: no cover - CLI ergonomics only
+    print("Error: python-docx library not found.", file=sys.stderr)
+    print("Install it with: pip install python-docx", file=sys.stderr)
+    sys.exit(1)
+
+DOCX_SUFFIX = ".docx"
+TEMP_PREFIX = "~$"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Scan DOCX files/folders, find styles with identical names, and remove duplicates by "
+            "reassigning their usage to a single canonical style."
+        )
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="DOCX files or folders to process (folders traversed recursively).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report duplicates without modifying files.",
+    )
+    return parser.parse_args()
+
+
+def collect_docx_paths(paths: Sequence[str]) -> List[Path]:
+    seen = set()
+    collected: List[Path] = []
+
+    for raw_path in paths:
+        path = Path(raw_path).expanduser()
+        if not path.exists():
+            print(f"Warning: {path} does not exist, skipping.", file=sys.stderr)
+            continue
+
+        if path.is_file():
+            if _is_valid_docx(path) and path not in seen:
+                collected.append(path)
+                seen.add(path)
+            continue
+
+        for docx_file in path.rglob(f"*{DOCX_SUFFIX}"):
+            if _is_valid_docx(docx_file) and docx_file not in seen:
+                collected.append(docx_file)
+                seen.add(docx_file)
+
+    return sorted(collected)
+
+
+def _is_valid_docx(path: Path) -> bool:
+    return (
+        path.is_file()
+        and path.suffix.lower() == DOCX_SUFFIX
+        and not path.name.startswith(TEMP_PREFIX)
+    )
+
+
+def deduplicate_styles_in_file(doc_path: Path, dry_run: bool) -> int:
+    document = Document(doc_path)
+    styles_by_name: Dict[str, List] = defaultdict(list)
+
+    for style in document.styles:
+        name = getattr(style, "name", None)
+        if name:
+            styles_by_name[name].append(style)
+
+    removed = 0
+
+    for name, styles in styles_by_name.items():
+        if len(styles) <= 1:
+            continue
+
+        canonical = styles[0]
+        for duplicate in styles[1:]:
+            if _reassign_style_usage(document, duplicate, canonical):
+                removed += 1
+            _remove_style(duplicate)
+
+    if removed and not dry_run:
+        document.save(doc_path)
+
+    return removed
+
+
+def _reassign_style_usage(document: Document, from_style, to_style) -> bool:
+    if from_style.style_id == to_style.style_id:
+        return False
+
+    from_id = from_style.style_id
+    changed = False
+
+    for paragraph in document.paragraphs:
+        if _reassign_in_paragraph(paragraph, from_id, to_style):
+            changed = True
+
+    for table in document.tables:
+        if table.style is not None and getattr(table.style, "style_id", None) == from_id:
+            table.style = to_style
+            changed = True
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    if _reassign_in_paragraph(paragraph, from_id, to_style):
+                        changed = True
+
+    return changed
+
+
+def _reassign_in_paragraph(paragraph, from_id: str, to_style) -> bool:
+    changed = False
+    if paragraph.style is not None and paragraph.style.style_id == from_id:
+        paragraph.style = to_style
+        changed = True
+    for run in paragraph.runs:
+        if run.style is not None and run.style.style_id == from_id:
+            run.style = to_style
+            changed = True
+    return changed
+
+
+def _remove_style(style) -> None:
+    parent = style.element.getparent()
+    if parent is not None:
+        parent.remove(style.element)
+
+
+def main() -> int:
+    args = parse_args()
+    docx_paths = collect_docx_paths(args.paths)
+    if not docx_paths:
+        print("No DOCX files found to process.", file=sys.stderr)
+        return 1
+
+    total_removed = 0
+    touched_files = 0
+    had_errors = False
+
+    for doc_path in docx_paths:
+        try:
+            removed = deduplicate_styles_in_file(doc_path, args.dry_run)
+        except Exception as exc:  # pragma: no cover - runtime safety
+            had_errors = True
+            print(f"Error processing {doc_path}: {exc}", file=sys.stderr)
+            continue
+
+        if removed:
+            touched_files += 1
+            total_removed += removed
+            status = "[DRY-RUN] " if args.dry_run else ""
+            print(f"{status}{doc_path}: removed {removed} duplicate style(s)")
+
+    print(
+        f"Removed {total_removed} duplicate style(s) across {touched_files} file(s)"
+        f"{' (dry-run)' if args.dry_run else ''}."
+    )
+
+    if had_errors:
+        print("Completed with errors.", file=sys.stderr)
+        return 1 if total_removed == 0 else 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

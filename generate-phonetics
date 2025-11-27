@@ -1,181 +1,311 @@
 #!/usr/bin/env python3
+"""Insert phonetics into DOCX files using the Lingua-BO-Wylie perl toolkit."""
 
+from __future__ import annotations
+
+import argparse
 import os
+import shutil
+import subprocess
 import sys
-import re
-import bophono
-from docx import Document
-from docx.shared import Pt
-from docx.enum.style import WD_STYLE_TYPE
+import tempfile
+from pathlib import Path
+from typing import Iterable, List
 
-PHON_KVP = bophono.UnicodeToApi(schema="KVP", options = {})
+try:
+    from docx import Document
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+    from docx.oxml import OxmlElement
+    from docx.shared import Mm, Pt
+    from docx.text.paragraph import Paragraph
+except ImportError as error:  # pragma: no cover - runtime guard
+    sys.stderr.write(
+        "python-docx is required. Install it with `pip install python-docx` before running this script.\n"
+    )
+    raise
 
-def create_phonetics_style(document):
-    """Create or get the Phonetics style with Calibri 11pt."""
+SCRIPT_DIR = Path(__file__).resolve().parent
+LINGUA_DIR = SCRIPT_DIR / "Lingua-BO-Wylie"
+PERL_LIB_PATH = LINGUA_DIR / "lib"
+PERL_SCRIPT_PATH = LINGUA_DIR / "bin" / "pronounce.pl"
+DEFAULT_TIBETAN_STYLE = "Verse Tibetan"
+DEFAULT_PHONETICS_STYLE = "Verse Phonetics"
+DEFAULT_MANTRA_STYLE = "Mantra  Tibetan"
+DEFAULT_SKIP_CHAR_STYLE = "Yigchung Tibetan Characters"
+GYUR_SUFFIX = " gyur"
+GYUR_TRIGGER_PHRASES = {
+    "མོས་ལ",
+    "བལྟས་ལ",
+    "བསམ",
+    "བསམ་ལ",
+    "བསམ་མོ",
+    "བསམ་ཞིང་",
+}
+TIBETAN_ENDING_PUNCTUATION = "།༎༑༏༐༔ཿ"
+
+
+def collect_docx_files(paths: Iterable[str]) -> List[Path]:
+    docx_files: List[Path] = []
+    for raw_path in paths:
+        path = Path(raw_path).expanduser().resolve()
+        if path.is_file():
+            if _is_valid_docx(path):
+                docx_files.append(path)
+            else:
+                sys.stderr.write(f"Skipped {path}: not a valid .docx file.\n")
+        elif path.is_dir():
+            for file_path in sorted(path.rglob("*.docx")):
+                if _is_valid_docx(file_path):
+                    docx_files.append(file_path.resolve())
+        else:
+            sys.stderr.write(f"Skipped {path}: not a .docx file or directory.\n")
+    return docx_files
+
+
+def _is_valid_docx(path: Path) -> bool:
+    return path.suffix.lower() == ".docx" and not path.name.startswith("~$")
+
+
+def ensure_perl_prerequisites() -> None:
+    if shutil.which("perl") is None:
+        raise RuntimeError("Perl is not available on PATH. Install it (e.g. `brew install perl`).")
+    if not PERL_SCRIPT_PATH.exists():
+        raise FileNotFoundError(f"Perl script not found at {PERL_SCRIPT_PATH}")
+    if not PERL_LIB_PATH.exists():
+        raise FileNotFoundError(f"Perl lib directory not found at {PERL_LIB_PATH}")
+
+
+def generate_phonetics_for_group(text: str) -> str:
+    if not text.strip():
+        return ""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_dir_path = Path(tmp_dir)
+        input_path = tmp_dir_path / "phonetics_input.txt"
+        output_path = tmp_dir_path / "phonetics_output.txt"
+        input_path.write_text(text, encoding="utf-8")
+        command = [
+            "perl",
+            f"-I{PERL_LIB_PATH}",
+            str(PERL_SCRIPT_PATH),
+            "-sty",
+            "padmakara-pt",
+            str(input_path),
+            str(output_path),
+        ]
+        subprocess.run(command, check=True, capture_output=True)
+        if not output_path.exists():
+            raise RuntimeError("Phonetics output file was not generated.")
+        result = output_path.read_text(encoding="utf-8")
+    sanitized = _clean_phonetics_text(result)
+    if not sanitized:
+        return ""
+    return sanitized[0].upper() + sanitized[1:]
+
+
+def _clean_phonetics_text(text: str) -> str:
+    stripped = text.replace("\r", "").replace("\n", "").strip()
+    return "".join(
+        ch for ch in stripped if (ord(ch) >= 0x20) or ch == "\t"
+    )
+
+
+def generate_phonetics_line(text: str) -> str:
+    groups = [group for group in text.split() if group.strip()]
+    phonetics_segments: List[str] = []
+    for group in groups:
+        phonetics = generate_phonetics_for_group(group)
+        if phonetics:
+            phonetics_segments.append(phonetics)
+    return "   ".join(phonetics_segments)
+
+
+def insert_paragraph_after(paragraph: Paragraph, text: str, style_name: str) -> Paragraph:
+    new_p = OxmlElement("w:p")
+    paragraph._p.addnext(new_p)
+    new_paragraph = Paragraph(new_p, paragraph._parent)
+    new_paragraph.style = style_name
+    if text:
+        new_paragraph.add_run(text)
+    return new_paragraph
+
+
+def ensure_phonetics_style(document: Document, style_name: str) -> None:
     try:
-        style = document.styles.add_style('Phonetics', WD_STYLE_TYPE.PARAGRAPH)
-    except:
-        style = document.styles['Phonetics']
-    
-    # Configure the style
+        document.styles[style_name]
+        return
+    except KeyError:
+        pass
+
+    style = document.styles.add_style(style_name, WD_STYLE_TYPE.PARAGRAPH)
+    paragraph_format = style.paragraph_format
+    paragraph_format.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+    paragraph_format.line_spacing = Pt(36)
+    paragraph_format.space_before = Mm(1)
+    paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
     font = style.font
-    font.name = 'Calibri'
-    font.size = Pt(11)
-    
-    return style
+    font.name = "Arial"
+    font.size = Pt(14)
+    font.bold = False
+    font.italic = False
 
-def segment_by_two(in_str):
-    lines = in_str.split("\n")
-    res = ""
-    for l in lines:
-        countsyls = len(re.findall("[\u0F35\u0F37ཀ-\u0f7e\u0F80-\u0FBC]+", l))
-        l = re.sub(r"([\u0F35\u0F37ཀ-\u0f7e\u0F80-\u0FBC]+[^\u0F35\u0F37ཀ-\u0f7e\u0F80-\u0FBC]+[\u0F35\u0F37ཀ-\u0f7e\u0F80-\u0FBC]+[^\u0F35\u0F37ཀ-\u0f7e\u0F80-\u0FBC]*)", r"\1 ", l)
-        if countsyls % 2 == 1:
-            l = re.sub(r" ([\u0F35\u0F37ཀ-\u0f7e\u0F80-\u0FBC]+[^\u0F35\u0F37ཀ-\u0f7e\u0F80-\u0FBC]*)$", r"\1", l)
-        res += l+"\n"
-    return res
 
-def generate_phonetics(in_str):
-    lines = in_str.split("\n")
-    res = []  # Store lines in a list instead of a string
-    for l in lines:
-        if not l.strip():  # Preserve empty lines
-            res.append("")
-            continue
-        words = l.split()
-        line = ""
-        for word in words:
-            line += f'{PHON_KVP.get_api(word)}  '
-        res.append(line.strip())
-    return res
+def process_docx(
+    path: Path,
+    tibetan_style: str,
+    phonetics_style: str,
+    mantra_style: str | None,
+    skip_char_style: str | None,
+) -> int:
+    document = Document(path)
+    ensure_phonetics_style(document, phonetics_style)
+    inserted_count = 0
+    index = 0
+    while True:
+        paragraphs = document.paragraphs
+        if index >= len(paragraphs):
+            break
+        paragraph = paragraphs[index]
+        paragraph_style = paragraph.style.name if paragraph.style is not None else ""
+        if paragraph_style == tibetan_style:
+            next_paragraph = paragraphs[index + 1] if index + 1 < len(paragraphs) else None
+            next_style = next_paragraph.style.name if next_paragraph and next_paragraph.style else ""
+            if mantra_style and next_style == mantra_style:
+                index += 1
+                continue
+            if next_style == phonetics_style and next_paragraph and next_paragraph.text.strip():
+                index += 2
+                continue
+            phonetics_source = _paragraph_text_for_phonetics(paragraph, skip_char_style)
+            phonetics_text = generate_phonetics_line(phonetics_source) if phonetics_source else ""
+            if phonetics_text.strip() and _needs_gyur_suffix(paragraph, skip_char_style):
+                trimmed = phonetics_text.rstrip()
+                if not trimmed.endswith(GYUR_SUFFIX):
+                    phonetics_text = trimmed + GYUR_SUFFIX
+                else:
+                    phonetics_text = trimmed
+            if phonetics_text.strip():
+                insert_paragraph_after(paragraph, phonetics_text, phonetics_style)
+                inserted_count += 1
+                index += 2
+                continue
+        index += 1
+    if inserted_count:
+        _safe_save_document(document, path)
+    return inserted_count
 
-def segment_by_two_and_generate_phonetics(in_str):
-    seg = segment_by_two(in_str)
-    return generate_phonetics(seg)
 
-def extract_text_from_docx(docx_path):
-    """Extract text from DOCX file, preserving paragraph breaks."""
-    doc = Document(docx_path)
-    text = ""
-    for paragraph in doc.paragraphs:
-        if paragraph.text.strip():
-            text += paragraph.text.strip() + "\n"
-        else:
-            text += "\n"  # Preserve empty paragraphs as line breaks
-    return text
-
-def read_text_file(file_path):
-    """Read text from a plain text file."""
-    with open(file_path, 'r', encoding='utf-8') as f:
-        return f.read()
-
-def get_file_content(file_path):
-    """Get content from either a DOCX or TXT file."""
-    if file_path.lower().endswith('.docx'):
-        return extract_text_from_docx(file_path)
-    elif file_path.lower().endswith('.txt'):
-        return read_text_file(file_path)
-    else:
-        raise ValueError("Unsupported file format. Only .txt and .docx files are supported.")
-
-def create_phonetics_docx(phonetic_lines, output_file):
-    """Create a DOCX file with phonetic content using the Phonetics style."""
-    doc = Document()
-    
-    # Create the Phonetics style
-    phonetics_style = create_phonetics_style(doc)
-    
-    # Add each line as a paragraph with the Phonetics style
-    for line in phonetic_lines:
-        if line:  # If line has content
-            paragraph = doc.add_paragraph(line)
-            paragraph.style = phonetics_style
-        else:  # Empty line
-            doc.add_paragraph()
-    
-    # Save the document
-    doc.save(output_file)
-
-def process_single_file(file_path):
-    """Process a single file (DOCX or TXT) and generate its phonetic version."""
+def _safe_save_document(document: Document, destination: Path) -> None:
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f"{destination.stem}_",
+        suffix=destination.suffix,
+        dir=str(destination.parent),
+        delete=False,
+    ) as tmp_file:
+        temp_path = Path(tmp_file.name)
     try:
-        if not (file_path.lower().endswith(('.docx', '.txt'))):
-            print(f"Skipping unsupported file: {file_path}")
-            return False
+        document.save(temp_path)
+        temp_path.replace(destination)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
-        # Extract text from file
-        content = get_file_content(file_path)
 
-        # Generate phonetics
-        phonetic_lines = segment_by_two_and_generate_phonetics(content)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Insert phonetics paragraphs into .docx files.")
+    parser.add_argument("paths", nargs="+", help="Files or folders to scan for .docx documents")
+    parser.add_argument("--tibetan-style", default=DEFAULT_TIBETAN_STYLE, dest="tibetan_style")
+    parser.add_argument("--phonetics-style", default=DEFAULT_PHONETICS_STYLE, dest="phonetics_style")
+    parser.add_argument("--mantra-style", default=DEFAULT_MANTRA_STYLE, dest="mantra_style")
+    parser.add_argument(
+        "--skip-char-style",
+        default=DEFAULT_SKIP_CHAR_STYLE,
+        dest="skip_char_style",
+        help=(
+            "Character style whose text should be excluded from phonetics generation. "
+            "Pass an empty string to disable."
+        ),
+    )
+    parser.add_argument(
+        "--no-mantra",
+        action="store_true",
+        help="Disable mantra style check (phonetics will also be inserted before mantra paragraphs).",
+    )
+    return parser.parse_args()
 
-        # Create output filename next to the original
-        base_name = os.path.splitext(file_path)[0]
-        output_file = f"{base_name}_phonetics.docx"
 
-        # Create the DOCX file with phonetic content
-        create_phonetics_docx(phonetic_lines, output_file)
+def main() -> None:
+    args = parse_args()
+    mantra_style = None if args.no_mantra else args.mantra_style
+    skip_char_style = args.skip_char_style.strip() or None
+    ensure_perl_prerequisites()
+    docx_files = collect_docx_files(args.paths)
+    if not docx_files:
+        sys.stderr.write("No .docx files found.\n")
+        return
+    total_inserted = 0
+    for docx_path in docx_files:
+        try:
+            inserted = process_docx(
+                docx_path,
+                args.tibetan_style,
+                args.phonetics_style,
+                mantra_style,
+                skip_char_style,
+            )
+            total_inserted += inserted
+            print(f"{docx_path}: inserted {inserted} phonetics paragraph(s)")
+        except subprocess.CalledProcessError as error:
+            sys.stderr.write(f"Failed to generate phonetics for {docx_path}: {error}\n")
+        except Exception as error:  # pragma: no cover - defensive
+            sys.stderr.write(f"Error processing {docx_path}: {error}\n")
+    print(f"Done. Total phonetics paragraphs inserted: {total_inserted}")
 
-        print(f"Generated phonetics for: {os.path.basename(file_path)}")
-        return True
 
-    except Exception as e:
-        print(f"Error processing {file_path}: {str(e)}")
-        return False
-
-def process_folder(folder_path):
-    """Process all DOCX and TXT files in the given folder."""
-    if not os.path.exists(folder_path):
-        print(f"Error: Folder '{folder_path}' does not exist.")
-        return False
-
-    success = True
-    processed_files = 0
-
-    # Process each file in the folder
-    for filename in os.listdir(folder_path):
-        if not filename.lower().endswith(('.docx', '.txt')):
+def _paragraph_text_for_phonetics(paragraph: Paragraph, skip_char_style: str | None) -> str:
+    if not skip_char_style:
+        return paragraph.text
+    fragments: List[str] = []
+    for run in paragraph.runs:
+        text = run.text
+        if not text:
             continue
-            
-        source_file = os.path.join(folder_path, filename)
-        
-        # Skip if it's a directory
-        if os.path.isdir(source_file):
-            continue
-
-        # Process the file
-        if process_single_file(source_file):
-            processed_files += 1
+        style_name = _style_name(getattr(run, "style", None))
+        if style_name == skip_char_style:
+            fragments.append(" ")
         else:
-            success = False
+            fragments.append(text)
+    return "".join(fragments)
 
-    if processed_files > 0:
-        print(f"\nProcessed {processed_files} file(s) in {folder_path}")
-    else:
-        print(f"\nNo supported files found in {folder_path}")
 
-    return success
+def _style_name(style) -> str | None:
+    if style is None:
+        return None
+    return getattr(style, "name", None) or str(style)
 
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: python script.py <file_or_folder_path>")
-        print("Supported file formats: .txt, .docx")
-        sys.exit(1)
 
-    path = sys.argv[1]
-    
-    if not os.path.exists(path):
-        print(f"Error: Path '{path}' does not exist.")
-        sys.exit(1)
+def _needs_gyur_suffix(paragraph: Paragraph, skip_char_style: str | None) -> bool:
+    if not skip_char_style:
+        return False
+    for run in reversed(paragraph.runs):
+        text = run.text.strip()
+        if not text:
+            continue
+        style_name = _style_name(getattr(run, "style", None))
+        if style_name != skip_char_style:
+            return False
+        normalized = _strip_tibetan_trailing_punctuation(text)
+        return normalized in GYUR_TRIGGER_PHRASES
+    return False
 
-    if os.path.isfile(path):
-        # Process single file
-        success = process_single_file(path)
-    else:
-        # Process folder
-        success = process_folder(path)
 
-    sys.exit(0 if success else 1)
+def _strip_tibetan_trailing_punctuation(text: str) -> str:
+    stripped = text.rstrip(TIBETAN_ENDING_PUNCTUATION)
+    return stripped.strip()
+
 
 if __name__ == "__main__":
     main()

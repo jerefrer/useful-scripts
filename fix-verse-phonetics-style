@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert regular spaces to non-breaking spaces in Tibetan-styled paragraphs."""
+"""Ensure the 'Verse Phonetics' style uses the requested formatting across DOCX files."""
 
 from __future__ import annotations
 
@@ -10,6 +10,9 @@ from typing import List, Sequence, Tuple
 
 try:
     from docx import Document
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.enum.text import WD_LINE_SPACING
+    from docx.shared import Pt
 except ImportError:  # pragma: no cover - CLI ergonomics only
     print("Error: python-docx library not found.", file=sys.stderr)
     print("Install it with: pip install python-docx", file=sys.stderr)
@@ -17,15 +20,14 @@ except ImportError:  # pragma: no cover - CLI ergonomics only
 
 DOCX_SUFFIX = ".docx"
 TEMP_PREFIX = "~$"
-NBSP = "\u00A0"
+STYLE_NAME = "Verse Phonetics"
+LINE_SPACING_PT = None
+FONT_SIZE_PT = 14
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Replace normal spaces with non-breaking spaces in every paragraph whose "
-            "style name contains 'Tibetan'. Accepts DOCX files and/or folders."
-        )
+        description="Set 'Verse Phonetics' style 14pt Arial, standard line spacing, no left indent."
     )
     parser.add_argument(
         "paths",
@@ -35,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show what would change without modifying any files.",
+        help="Show which files would change without saving them.",
     )
     return parser.parse_args()
 
@@ -54,8 +56,6 @@ def collect_docx_paths(paths: Sequence[str]) -> List[Path]:
             if _is_valid_docx(path) and path not in seen:
                 found.append(path)
                 seen.add(path)
-            elif path.suffix.lower() != DOCX_SUFFIX:
-                print(f"Warning: {path} is not a DOCX file, skipping.", file=sys.stderr)
             continue
 
         for docx_file in path.rglob(f"*{DOCX_SUFFIX}"):
@@ -74,46 +74,52 @@ def _is_valid_docx(path: Path) -> bool:
     )
 
 
-def process_file(doc_path: Path, dry_run: bool) -> Tuple[int, int]:
+def update_style_in_file(doc_path: Path, dry_run: bool) -> bool:
     document = Document(doc_path)
-    modified_paragraphs = 0
-    replaced_spaces = 0
+    style = _ensure_style(document)
+    changed = _apply_formatting(style)
 
-    for paragraph in document.paragraphs:
-        if not _has_tibetan_style(paragraph):
-            continue
-        changed, replacements = _replace_spaces_in_paragraph(paragraph)
-        if changed:
-            modified_paragraphs += 1
-            replaced_spaces += replacements
-
-    if modified_paragraphs and not dry_run:
+    if changed and not dry_run:
         document.save(doc_path)
-
-    return modified_paragraphs, replaced_spaces
-
-
-def _has_tibetan_style(paragraph) -> bool:
-    style = getattr(paragraph, "style", None)
-    name = getattr(style, "name", "") or ""
-    return "tibetan" in name.lower()
+    return changed
 
 
-def _replace_spaces_in_paragraph(paragraph) -> Tuple[bool, int]:
+def _ensure_style(document: Document):
+    try:
+        return document.styles[STYLE_NAME]
+    except KeyError:
+        return document.styles.add_style(STYLE_NAME, WD_STYLE_TYPE.PARAGRAPH)
+
+
+def _apply_formatting(style) -> bool:
     changed = False
-    replacements = 0
+    paragraph_format = style.paragraph_format
 
-    for run in paragraph.runs:
-        text = run.text
-        if not text or " " not in text:
-            continue
-        new_text = text.replace(" ", NBSP)
-        if new_text != text:
-            replacements += text.count(" ")
-            run.text = new_text
-            changed = True
+    if paragraph_format.line_spacing_rule != WD_LINE_SPACING.SINGLE:
+        paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
+        changed = True
+    if paragraph_format.line_spacing is not None:
+        paragraph_format.line_spacing = None
+        changed = True
+    if paragraph_format.left_indent:
+        paragraph_format.left_indent = Pt(0)
+        changed = True
 
-    return changed, replacements
+    font = style.font
+    if font.name != "Arial":
+        font.name = "Arial"
+        changed = True
+    if font.size != Pt(FONT_SIZE_PT):
+        font.size = Pt(FONT_SIZE_PT)
+        changed = True
+    if font.bold:
+        font.bold = False
+        changed = True
+    if font.italic:
+        font.italic = False
+        changed = True
+
+    return changed
 
 
 def main() -> int:
@@ -123,39 +129,29 @@ def main() -> int:
         print("No DOCX files found to process.", file=sys.stderr)
         return 1
 
-    total_paragraphs = 0
-    total_spaces = 0
-    touched_files = 0
+    touched = 0
     had_errors = False
 
     for doc_path in docx_paths:
         try:
-            modified, replacements = process_file(doc_path, args.dry_run)
+            changed = update_style_in_file(doc_path, args.dry_run)
         except Exception as exc:  # pragma: no cover - runtime safety
             had_errors = True
             print(f"Error processing {doc_path}: {exc}", file=sys.stderr)
             continue
 
-        if modified:
-            touched_files += 1
-            total_paragraphs += modified
-            total_spaces += replacements
+        if changed:
+            touched += 1
             status = "[DRY-RUN] " if args.dry_run else ""
-            print(
-                f"{status}{doc_path}: replaced {replacements} space(s) across "
-                f"{modified} Tibetan paragraph(s)"
-            )
-        else:
-            print(f"{doc_path}: no Tibetan paragraphs needed changes")
+            print(f"{status}{doc_path}: updated '{STYLE_NAME}' style")
 
     print(
-        f"Updated {total_paragraphs} paragraph(s) and {total_spaces} space(s) "
-        f"across {touched_files} file(s){' (dry-run)' if args.dry_run else ''}."
+        f"Style updates applied to {touched} file(s){' (dry-run)' if args.dry_run else ''}."
     )
 
     if had_errors:
         print("Completed with errors.", file=sys.stderr)
-        return 1
+        return 1 if not touched else 2
     return 0
 
 

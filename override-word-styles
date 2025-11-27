@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+"""Override shared Word styles in target DOCX files based on a source document."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
+try:
+    from docx import Document
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+except ImportError:  # pragma: no cover - CLI ergonomics only
+    print("Error: python-docx library not found.", file=sys.stderr)
+    print("Install it with: pip install python-docx", file=sys.stderr)
+    sys.exit(1)
+
+DOCX_SUFFIX = ".docx"
+TEMP_PREFIX = "~$"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Copy style definitions from a source DOCX into many target DOCX files,"
+            " overriding only styles present in both documents."
+        )
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="Target DOCX files or folders to update (folders scanned recursively).",
+    )
+    parser.add_argument(
+        "--source",
+        required=True,
+        help="Reference DOCX file whose style definitions should be copied.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would change without modifying any files.",
+    )
+    return parser.parse_args()
+
+
+def collect_docx_paths(paths: Sequence[str]) -> List[Path]:
+    gathered: List[Path] = []
+    seen = set()
+    for raw_path in paths:
+        path = Path(raw_path).expanduser()
+        if not path.exists():
+            print(f"Warning: {path} does not exist, skipping.", file=sys.stderr)
+            continue
+        if path.is_file():
+            if _is_valid_docx(path) and path not in seen:
+                gathered.append(path)
+                seen.add(path)
+            continue
+        for docx_file in path.rglob(f"*{DOCX_SUFFIX}"):
+            if _is_valid_docx(docx_file) and docx_file not in seen:
+                gathered.append(docx_file)
+                seen.add(docx_file)
+    return sorted(gathered)
+
+
+def _is_valid_docx(path: Path) -> bool:
+    return (
+        path.is_file()
+        and path.suffix.lower() == DOCX_SUFFIX
+        and not path.name.startswith(TEMP_PREFIX)
+    )
+
+
+def load_source_styles(source_path: Path) -> Dict[str, object]:
+    document = Document(source_path)
+    styles: Dict[str, object] = {}
+    for style in document.styles:
+        name = getattr(style, "name", None)
+        if name:
+            styles[name] = style
+    return styles
+
+
+def override_styles_in_file(
+    doc_path: Path,
+    source_styles: Dict[str, object],
+    dry_run: bool,
+) -> int:
+    document = Document(doc_path)
+    changed_count = 0
+
+    for target_style in document.styles:
+        name = getattr(target_style, "name", None)
+        if not name or name not in source_styles:
+            continue
+        source_style = source_styles[name]
+        changed = False
+        if _copy_rfonts(source_style, target_style):
+            changed = True
+        if _copy_font_sizes(source_style, target_style):
+            changed = True
+        if _copy_paragraph_spacing(source_style, target_style):
+            changed = True
+        if _copy_paragraph_indentation(source_style, target_style):
+            changed = True
+        if changed:
+            changed_count += 1
+
+    if changed_count and not dry_run:
+        document.save(doc_path)
+
+    return changed_count
+
+
+def _copy_rfonts(source_style, target_style) -> bool:
+    attrs = _resolve_child_attributes(
+        source_style,
+        parent_tag="w:rPr",
+        child_tag="w:rFonts",
+        attributes=[
+            "w:ascii",
+            "w:hAnsi",
+            "w:eastAsia",
+            "w:cs",
+            "w:asciiTheme",
+            "w:hAnsiTheme",
+            "w:eastAsiaTheme",
+            "w:csTheme",
+        ],
+    )
+    return _apply_child_attributes(
+        target_style, "w:rPr", "w:rFonts", attrs
+    )
+
+
+def _copy_font_sizes(source_style, target_style) -> bool:
+    changed = False
+    for tag in ("w:sz", "w:szCs"):
+        value = _resolve_child_value(
+            source_style, parent_tag="w:rPr", child_tag=tag, attribute="w:val"
+        )
+        if _apply_child_value(target_style, "w:rPr", tag, "w:val", value):
+            changed = True
+    return changed
+
+
+def _copy_paragraph_spacing(source_style, target_style) -> bool:
+    attrs = _resolve_child_attributes(
+        source_style,
+        parent_tag="w:pPr",
+        child_tag="w:spacing",
+        attributes=["w:line", "w:lineRule", "w:before", "w:after"],
+    )
+    return _apply_child_attributes(
+        target_style, "w:pPr", "w:spacing", attrs
+    )
+
+
+def _copy_paragraph_indentation(source_style, target_style) -> bool:
+    attrs = _resolve_child_attributes(
+        source_style,
+        parent_tag="w:pPr",
+        child_tag="w:ind",
+        attributes=["w:left", "w:start"],
+    )
+    return _apply_child_attributes(target_style, "w:pPr", "w:ind", attrs)
+
+
+def _resolve_child_attributes(style, parent_tag, child_tag, attributes) -> Dict[str, str | None]:
+    values = {attr: None for attr in attributes}
+    for ancestor in _style_chain(style):
+        parent = ancestor.element.find(qn(parent_tag))
+        if parent is None:
+            continue
+        child = parent.find(qn(child_tag))
+        if child is None:
+            continue
+        for attr in attributes:
+            if values[attr] is None:
+                value = child.get(qn(attr))
+                if value is not None:
+                    values[attr] = value
+    return values
+
+
+def _resolve_child_value(style, parent_tag, child_tag, attribute) -> str | None:
+    for ancestor in _style_chain(style):
+        parent = ancestor.element.find(qn(parent_tag))
+        if parent is None:
+            continue
+        child = parent.find(qn(child_tag))
+        if child is None:
+            continue
+        value = child.get(qn(attribute))
+        if value is not None:
+            return value
+    return None
+
+
+def _apply_child_attributes(target_style, parent_tag, child_tag, attr_map) -> bool:
+    target_parent = target_style.element.find(qn(parent_tag))
+    target_child = None if target_parent is None else target_parent.find(qn(child_tag))
+
+    need_child = any(value is not None for value in attr_map.values())
+    changed = False
+
+    if need_child:
+        if target_parent is None:
+            target_parent = _append_child(target_style.element, parent_tag)
+        if target_child is None:
+            target_child = _append_child(target_parent, child_tag)
+    elif target_parent is None:
+        return False
+
+    for attr, value in attr_map.items():
+        current = None
+        if target_child is not None:
+            current = target_child.get(qn(attr))
+        if value is None:
+            if current is not None and target_child is not None:
+                del target_child.attrib[qn(attr)]
+                changed = True
+        else:
+            if current != value:
+                target_child.set(qn(attr), value)
+                changed = True
+
+    if not need_child and target_child is not None and not target_child.attrib:
+        target_parent.remove(target_child)
+        changed = True
+
+    return changed
+
+
+def _apply_child_value(target_style, parent_tag, child_tag, attribute, value) -> bool:
+    attr_map = {attribute: value}
+    return _apply_child_attributes(target_style, parent_tag, child_tag, attr_map)
+
+
+def _append_child(parent, tag: str):
+    child = OxmlElement(tag)
+    parent.append(child)
+    return child
+
+
+def _remove_child(parent, child_tag: str) -> bool:
+    if parent is None:
+        return False
+    child = parent.find(qn(child_tag))
+    if child is None:
+        return False
+    parent.remove(child)
+    return True
+
+
+def _style_chain(style) -> List:
+    chain: List = []
+    seen_ids = set()
+    current = style
+    while current is not None:
+        current_id = getattr(current, "style_id", id(current))
+        if current_id in seen_ids:
+            break
+        chain.insert(0, current)
+        seen_ids.add(current_id)
+        current = getattr(current, "base_style", None)
+    return chain
+
+
+def main() -> int:
+    args = parse_args()
+    source_path = Path(args.source).expanduser()
+    if not _is_valid_docx(source_path):
+        print(f"Error: source file is not a DOCX: {source_path}", file=sys.stderr)
+        return 2
+
+    try:
+        source_styles = load_source_styles(source_path)
+    except Exception as exc:
+        print(f"Error loading source styles: {exc}", file=sys.stderr)
+        return 2
+
+    target_paths = [path for path in collect_docx_paths(args.paths) if path != source_path]
+    if not target_paths:
+        print("No target DOCX files found to process.", file=sys.stderr)
+        return 1
+
+    total_changed = 0
+    touched_files = 0
+    had_errors = False
+
+    for doc_path in target_paths:
+        try:
+            changed = override_styles_in_file(
+                doc_path, source_styles, args.dry_run
+            )
+        except Exception as exc:  # pragma: no cover - runtime safety
+            had_errors = True
+            print(f"Error processing {doc_path}: {exc}", file=sys.stderr)
+            continue
+
+        if changed:
+            touched_files += 1
+            total_changed += changed
+            prefix = "[DRY-RUN] " if args.dry_run else ""
+            print(f"{prefix}{doc_path}: overridden {changed} style(s)")
+
+    print(
+        f"Overrode {total_changed} style definition(s) across {touched_files} file(s)"
+        f"{' (dry-run)' if args.dry_run else ''}."
+    )
+
+    if had_errors:
+        print("Completed with errors.", file=sys.stderr)
+        return 1 if total_changed == 0 else 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

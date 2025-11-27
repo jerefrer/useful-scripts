@@ -7,6 +7,7 @@ import argparse
 import csv
 import sys
 from pathlib import Path
+import re
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 try:
@@ -150,21 +151,34 @@ def rename_styles_in_file(doc_path: Path, mapping: Dict[str, str], dry_run: bool
     missing: List[str] = []
 
     for old_name, new_name in mapping.items():
-        matching_styles = [style for style in document.styles if style.name == old_name]
+        matching_styles = _find_styles_by_name(document, old_name)
         if not matching_styles:
             missing.append(old_name)
             continue
 
+        target_style = _find_style_by_name(document, new_name)
+
         for style in matching_styles:
-            if style.name == new_name:
+            if target_style is None or style is target_style:
+                if style.name != new_name:
+                    _rename_style(style, new_name)
+                    renamed_count += 1
+                target_style = style
                 continue
-            _set_style_name(style, new_name)
-            renamed_count += 1
+
+            if _reassign_style_usage(document, style, target_style):
+                renamed_count += 1
+            _remove_style(style)
 
     if renamed_count and not dry_run:
         document.save(doc_path)
 
     return renamed_count, missing
+
+
+def _rename_style(style, new_name: str) -> None:
+    _set_style_name(style, new_name)
+    _set_style_id(style, _style_id_from_name(new_name))
 
 
 def _set_style_name(style, new_name: str) -> None:
@@ -173,6 +187,68 @@ def _set_style_name(style, new_name: str) -> None:
         name_element = OxmlElement("w:name")
         style.element.insert(0, name_element)
     name_element.set(qn("w:val"), new_name)
+
+
+def _set_style_id(style, style_id: str) -> None:
+    style.element.set(qn("w:styleId"), style_id)
+
+
+def _style_id_from_name(name: str) -> str:
+    sanitized = re.sub(r"[^0-9A-Za-z]", "", name)
+    if not sanitized:
+        sanitized = "Style"
+    return sanitized[:31]
+
+
+def _find_styles_by_name(document: Document, style_name: str) -> List:
+    return [style for style in document.styles if style.name == style_name]
+
+
+def _find_style_by_name(document: Document, style_name: str):
+    styles = _find_styles_by_name(document, style_name)
+    return styles[0] if styles else None
+
+
+def _reassign_style_usage(document: Document, from_style, to_style) -> bool:
+    if from_style.style_id == to_style.style_id:
+        return False
+
+    from_id = from_style.style_id
+    changed = False
+
+    for paragraph in document.paragraphs:
+        if _reassign_style_in_paragraph(paragraph, from_id, to_style):
+            changed = True
+
+    for table in document.tables:
+        if table.style is not None and getattr(table.style, "style_id", None) == from_id:
+            table.style = to_style
+            changed = True
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    if _reassign_style_in_paragraph(paragraph, from_id, to_style):
+                        changed = True
+
+    return changed
+
+
+def _reassign_style_in_paragraph(paragraph, from_style_id: str, to_style) -> bool:
+    changed = False
+    if paragraph.style is not None and paragraph.style.style_id == from_style_id:
+        paragraph.style = to_style
+        changed = True
+    for run in paragraph.runs:
+        if run.style is not None and run.style.style_id == from_style_id:
+            run.style = to_style
+            changed = True
+    return changed
+
+
+def _remove_style(style) -> None:
+    parent = style.element.getparent()
+    if parent is not None:
+        parent.remove(style.element)
 
 
 def main() -> int:

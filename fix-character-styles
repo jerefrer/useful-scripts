@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""Convert fully character-styled paragraphs into paragraph styles in DOCX files."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterator, List, Sequence
+
+try:
+    from docx import Document
+    from docx.text.paragraph import Paragraph
+except ImportError:  # pragma: no cover - CLI ergonomics only
+    print("Error: python-docx library not found.", file=sys.stderr)
+    print("Install it with: pip install python-docx", file=sys.stderr)
+    sys.exit(1)
+
+DOCX_SUFFIX = ".docx"
+TEMP_PREFIX = "~$"
+
+
+@dataclass(frozen=True)
+class StyleMapping:
+    char_style: str
+    para_style: str
+    remove_style: str | None = None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Replace paragraphs that are entirely formatted with a specific "
+            "character style by applying a paragraph style instead."
+        )
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="DOCX files or folders to scan (folders are processed recursively)",
+    )
+
+    mapping_group = parser.add_mutually_exclusive_group(required=True)
+    mapping_group.add_argument(
+        "--styles",
+        nargs=2,
+        metavar=("CHAR_STYLE", "PARA_STYLE"),
+        help="Single mapping: if a paragraph is fully CHAR_STYLE, apply PARA_STYLE.",
+    )
+    mapping_group.add_argument(
+        "--mapping-csv",
+        metavar="CSV",
+        help=(
+            "CSV file with two or three columns: character style name, paragraph style "
+            "name, and optional paragraph style to remove immediately after conversion."
+        ),
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would change without modifying any files.",
+    )
+
+    parser.add_argument(
+        "--remove-phonetics",
+        metavar="STYLE",
+        dest="remove_phonetics",
+        help=(
+            "When used with --styles, remove the next paragraph if it already uses the given "
+            "paragraph style (e.g., existing phonetics). For CSV mappings, provide the removal "
+            "style in the third column to enable this behavior per row."
+        ),
+    )
+
+    return parser.parse_args()
+
+
+def collect_docx_paths(paths: Sequence[str]) -> List[Path]:
+    found: List[Path] = []
+    seen = set()
+
+    for raw_path in paths:
+        path = Path(raw_path).expanduser()
+        if not path.exists():
+            print(f"Warning: {path} does not exist, skipping.", file=sys.stderr)
+            continue
+
+        if path.is_file():
+            if _is_valid_docx(path) and path not in seen:
+                found.append(path)
+                seen.add(path)
+            elif path.suffix.lower() != DOCX_SUFFIX:
+                print(f"Warning: {path} is not a DOCX file, skipping.", file=sys.stderr)
+            continue
+
+        for docx_file in path.rglob(f"*{DOCX_SUFFIX}"):
+            if _is_valid_docx(docx_file) and docx_file not in seen:
+                found.append(docx_file)
+                seen.add(docx_file)
+
+    return sorted(found)
+
+
+def _is_valid_docx(path: Path) -> bool:
+    return (
+        path.is_file()
+        and path.suffix.lower() == DOCX_SUFFIX
+        and not path.name.startswith(TEMP_PREFIX)
+    )
+
+
+def load_mapping_from_args(args: argparse.Namespace) -> List[StyleMapping]:
+    if args.styles:
+        char_name, para_name = (value.strip() for value in args.styles)
+        if not char_name or not para_name:
+            raise ValueError("Style names cannot be empty.")
+        remove_style = args.remove_phonetics.strip() if args.remove_phonetics else None
+        return [StyleMapping(char_name, para_name, remove_style)]
+
+    if args.mapping_csv:
+        csv_path = Path(args.mapping_csv).expanduser()
+        if not csv_path.is_file():
+            raise ValueError(f"Mapping CSV not found: {csv_path}")
+        return _load_mapping_from_csv(csv_path)
+
+    raise ValueError("Either --styles or --mapping-csv must be provided.")
+
+
+def _load_mapping_from_csv(csv_path: Path) -> List[StyleMapping]:
+    mapping: List[StyleMapping] = []
+    with csv_path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.reader(handle)
+        for row_number, row in enumerate(reader, start=1):
+            if not row:
+                continue
+            if len(row) < 2:
+                raise ValueError(
+                    f"CSV {csv_path} line {row_number} must contain at least two columns."
+                )
+            char_name, para_name = row[0].strip(), row[1].strip()
+            if not char_name or not para_name:
+                raise ValueError(
+                    f"CSV {csv_path} line {row_number} contains an empty style name."
+                )
+            if row_number == 1 and _looks_like_header(char_name, para_name):
+                continue
+            remove_style = None
+            if len(row) >= 3:
+                remove_style = row[2].strip() or None
+            mapping.append(StyleMapping(char_name, para_name, remove_style))
+
+    if not mapping:
+        raise ValueError(f"CSV {csv_path} did not yield any style mappings.")
+    return mapping
+
+
+def _looks_like_header(first: str, second: str) -> bool:
+    header_tokens = {"char", "character", "char_style", "from", "source"}
+    target_tokens = {"para", "paragraph", "para_style", "to", "target"}
+    return first.lower() in header_tokens and second.lower() in target_tokens
+
+
+def process_file(doc_path: Path, mappings: List[StyleMapping], dry_run: bool) -> tuple[int, List[str]]:
+    document = Document(doc_path)
+    converted = 0
+    missing_para_styles: List[str] = []
+
+    for entry in mappings:
+        target_para = _find_paragraph_style(document, entry.para_style)
+        if target_para is None:
+            missing_para_styles.append(entry.para_style)
+            continue
+        converted += _convert_paragraphs(
+            document,
+            entry.char_style,
+            target_para,
+            entry.remove_style,
+        )
+
+    if converted and not dry_run:
+        document.save(doc_path)
+
+    return converted, missing_para_styles
+
+
+def _find_paragraph_style(document: Document, style_name: str):
+    for style in document.styles:
+        if getattr(style, "name", None) == style_name and getattr(style, "type", None) == 1:
+            return style
+    return None
+
+
+def _convert_paragraphs(
+    document: Document,
+    char_style_name: str,
+    target_para_style,
+    remove_style_name: str | None,
+) -> int:
+    converted = 0
+    for paragraph in _iter_paragraphs(document):
+        if paragraph._p.getparent() is None:
+            continue
+        if not paragraph.runs:
+            continue
+        if not _paragraph_is_entirely_char_style(paragraph, char_style_name):
+            continue
+        paragraph.style = target_para_style
+        _clear_character_style(paragraph, char_style_name)
+        if remove_style_name:
+            _remove_following_paragraph(paragraph, remove_style_name)
+        converted += 1
+    return converted
+
+
+def _iter_paragraphs(document: Document) -> Iterator:
+    for paragraph in document.paragraphs:
+        yield paragraph
+    for table in document.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    yield paragraph
+
+
+def _paragraph_is_entirely_char_style(paragraph, char_style_name: str) -> bool:
+    has_char_content = False
+    for run in paragraph.runs:
+        text = run.text
+        if not text or not text.strip():
+            continue
+        run_style_name = _style_name(run.style)
+        if run_style_name != char_style_name:
+            return False
+        has_char_content = True
+    return has_char_content
+
+
+def _clear_character_style(paragraph, char_style_name: str) -> None:
+    for run in paragraph.runs:
+        if _style_name(run.style) == char_style_name:
+            run.style = None
+
+
+def _style_name(style) -> str | None:
+    if style is None:
+        return None
+    return getattr(style, "name", None) or str(style)
+
+
+def _remove_following_paragraph(paragraph, expected_style: str) -> bool:
+    next_element = paragraph._p.getnext()
+    if next_element is None or next_element.tag != paragraph._p.tag:
+        return False
+    next_paragraph = Paragraph(next_element, paragraph._parent)
+    next_style_name = _style_name(next_paragraph.style)
+    if next_style_name != expected_style:
+        return False
+    parent = next_element.getparent()
+    if parent is None:
+        return False
+    parent.remove(next_element)
+    return True
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        mapping = load_mapping_from_args(args)
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 2
+
+    docx_paths = collect_docx_paths(args.paths)
+    if not docx_paths:
+        print("No DOCX files found to process.", file=sys.stderr)
+        return 1
+
+    total_converted = 0
+    touched_files = 0
+    missing_styles_overall: Dict[str, int] = {}
+    had_errors = False
+
+    for doc_path in docx_paths:
+        try:
+            converted, missing_para_styles = process_file(doc_path, mapping, args.dry_run)
+        except Exception as exc:  # pragma: no cover - runtime safety
+            had_errors = True
+            print(f"Error processing {doc_path}: {exc}", file=sys.stderr)
+            continue
+
+        if converted:
+            total_converted += converted
+            touched_files += 1
+        for style_name in missing_para_styles:
+            missing_styles_overall[style_name] = missing_styles_overall.get(style_name, 0) + 1
+
+        prefix = "[DRY-RUN] " if args.dry_run else ""
+        if converted:
+            print(f"{prefix}{doc_path}: converted {converted} paragraph(s)")
+        else:
+            print(f"{prefix}{doc_path}: no paragraphs fully using mapped character styles")
+
+    summary = (
+        f"Converted {total_converted} paragraph(s) across {touched_files} file(s)"
+        f"{' (dry-run)' if args.dry_run else ''}."
+    )
+    print(summary)
+
+    if missing_styles_overall:
+        missing_summary = ", ".join(
+            f"'{name}' missing in {count} file(s)" for name, count in missing_styles_overall.items()
+        )
+        print(f"Paragraph styles not found: {missing_summary}")
+
+    if had_errors:
+        print("Completed with errors.", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
