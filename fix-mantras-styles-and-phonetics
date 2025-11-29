@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""Convert mantra passages to Mantra Tibetan style and remove duplicate phonetics paragraphs."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import tempfile
+from pathlib import Path
+from typing import Iterable, List
+
+try:
+    from docx import Document
+    from docx.document import Document as DocxDocument
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import _Cell, Table
+    from docx.text.paragraph import Paragraph
+except ImportError:  # pragma: no cover - CLI ergonomics only
+    print("Error: python-docx library not found.", file=sys.stderr)
+    print("Install it with: pip install python-docx", file=sys.stderr)
+    sys.exit(1)
+
+DOCX_SUFFIX = ".docx"
+TEMP_PREFIX = "~$"
+DEFAULT_VERSE_TIBETAN = "Verse Tibetan"
+DEFAULT_VERSE_PHONETICS = "Verse Phonetics"
+DEFAULT_MANTRA_TIBETAN = "Mantra Tibetan"
+DEFAULT_MANTRA_PHONETICS = "Mantra Phonetics"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Find sequences of Verse Tibetan + Verse Phonetics + Mantra Phonetics, "
+            "convert the Tibetan paragraph to Mantra Tibetan, and delete the extra phonetics."
+        )
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="DOCX files or folders to scan (folders are processed recursively)",
+    )
+    parser.add_argument(
+        "--tibetan-style",
+        default=DEFAULT_VERSE_TIBETAN,
+        dest="tibetan_style",
+        help="Name of the Verse Tibetan style to target (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--phonetics-style",
+        default=DEFAULT_VERSE_PHONETICS,
+        dest="phonetics_style",
+        help="Name of the Verse Phonetics style to remove (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--mantra-tibetan-style",
+        default=DEFAULT_MANTRA_TIBETAN,
+        dest="mantra_tibetan_style",
+        help="Name of the Mantra Tibetan style to apply (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--mantra-phonetics-style",
+        default=DEFAULT_MANTRA_PHONETICS,
+        dest="mantra_phonetics_style",
+        help="Name of the Mantra Phonetics style following the removed paragraph (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would change without modifying files.",
+    )
+    return parser.parse_args()
+
+
+def collect_docx_paths(paths: Iterable[str]) -> List[Path]:
+    found: List[Path] = []
+    seen = set()
+    for raw_path in paths:
+        path = Path(raw_path).expanduser()
+        if not path.exists():
+            print(f"Warning: {path} does not exist, skipping.", file=sys.stderr)
+            continue
+        if path.is_file():
+            if _is_valid_docx(path) and path not in seen:
+                found.append(path)
+                seen.add(path)
+            elif path.suffix.lower() != DOCX_SUFFIX:
+                print(f"Warning: {path} is not a DOCX file, skipping.", file=sys.stderr)
+            continue
+        for docx_file in path.rglob(f"*{DOCX_SUFFIX}"):
+            if _is_valid_docx(docx_file) and docx_file not in seen:
+                found.append(docx_file)
+                seen.add(docx_file)
+    return sorted(found)
+
+
+def _is_valid_docx(path: Path) -> bool:
+    return (
+        path.is_file()
+        and path.suffix.lower() == DOCX_SUFFIX
+        and not path.name.startswith(TEMP_PREFIX)
+    )
+
+
+def process_file(
+    doc_path: Path,
+    tibetan_style: str,
+    verse_phonetics_style: str,
+    mantra_tibetan_style: str,
+    mantra_phonetics_style: str,
+    dry_run: bool,
+) -> int:
+    document = Document(doc_path)
+    paragraphs = list(_iter_paragraphs(document))
+    changed = 0
+    index = 0
+    while index <= len(paragraphs) - 3:
+        first, second, third = paragraphs[index], paragraphs[index + 1], paragraphs[index + 2]
+        if not _match_style(first, tibetan_style):
+            index += 1
+            continue
+        if not _match_style(second, verse_phonetics_style):
+            index += 1
+            continue
+        if not _match_style(third, mantra_phonetics_style):
+            index += 1
+            continue
+
+        if first.style is None or first.style.name != mantra_tibetan_style:
+            first.style = mantra_tibetan_style
+        _remove_paragraph(second)
+        paragraphs.pop(index + 1)
+        changed += 1
+        # do not increment index to allow catching overlapping sequences
+    if changed and not dry_run:
+        _safe_save_document(document, doc_path)
+    return changed
+
+
+def _match_style(paragraph: Paragraph, expected_name: str) -> bool:
+    style_name = paragraph.style.name if paragraph.style is not None else ""
+    return style_name == expected_name
+
+
+def _remove_paragraph(paragraph: Paragraph) -> None:
+    element = paragraph._p
+    parent = element.getparent()
+    if parent is None:
+        return
+    parent.remove(element)
+
+
+def _iter_paragraphs(parent) -> Iterable[Paragraph]:
+    if isinstance(parent, DocxDocument):
+        parent_elm = parent.element.body
+    elif isinstance(parent, _Cell):
+        parent_elm = parent._tc
+    else:
+        parent_elm = parent
+    for child in parent_elm.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, parent)
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from _iter_paragraphs(cell)
+
+
+def _safe_save_document(document: Document, destination: Path) -> None:
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f"{destination.stem}_",
+        suffix=destination.suffix,
+        dir=str(destination.parent),
+        delete=False,
+    ) as tmp_file:
+        temp_path = Path(tmp_file.name)
+    try:
+        document.save(temp_path)
+        temp_path.replace(destination)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def main() -> int:
+    args = parse_args()
+    docx_paths = collect_docx_paths(args.paths)
+    if not docx_paths:
+        print("No DOCX files found to process.", file=sys.stderr)
+        return 1
+
+    total_changed = 0
+    touched_files = 0
+    had_errors = False
+
+    for doc_path in docx_paths:
+        try:
+            changed = process_file(
+                doc_path,
+                args.tibetan_style,
+                args.phonetics_style,
+                args.mantra_tibetan_style,
+                args.mantra_phonetics_style,
+                args.dry_run,
+            )
+        except Exception as exc:  # pragma: no cover - runtime safety
+            had_errors = True
+            print(f"Error processing {doc_path}: {exc}", file=sys.stderr)
+            continue
+
+        prefix = "[DRY-RUN] " if args.dry_run else ""
+        if changed:
+            touched_files += 1
+            total_changed += changed
+            print(f"{prefix}{doc_path}: adjusted {changed} sequence(s)")
+        else:
+            print(f"{prefix}{doc_path}: no matching sequences found")
+
+    summary = (
+        f"Adjusted {total_changed} sequence(s) across {touched_files} file(s)"
+        f"{' (dry-run)' if args.dry_run else ''}."
+    )
+    print(summary)
+
+    if had_errors:
+        print("Completed with errors.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

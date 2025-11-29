@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Sequence, Tuple
 
 try:
     from docx import Document
@@ -33,6 +33,7 @@ DEFAULT_TIBETAN_STYLE = "Verse Tibetan"
 DEFAULT_PHONETICS_STYLE = "Verse Phonetics"
 DEFAULT_MANTRA_STYLE = "Mantra  Tibetan"
 DEFAULT_SKIP_CHAR_STYLE = "Yigchung Tibetan Characters"
+DEFAULT_MANTRA_CHAR_STYLE = "Sanskrit at the beginning"
 GYUR_SUFFIX = " gyur"
 GYUR_TRIGGER_PHRASES = {
     "མོས་ལ",
@@ -40,9 +41,27 @@ GYUR_TRIGGER_PHRASES = {
     "བསམ",
     "བསམ་ལ",
     "བསམ་མོ",
+    "བསམ་ཞིང",
     "བསམ་ཞིང་",
+    "བསམ་ལ་བཟླ་ཞིང",
+    "བསམ་ལ་བཟླ་ཞིང་",
+    "གསལ་གདབ",
+    "མོས་པའི་ང་རྒྱལ་བསྐྱེད་དེ",
 }
-TIBETAN_ENDING_PUNCTUATION = "།༎༑༏༐༔ཿ"
+MANTRA_PREFIXES = {
+    "ཨོཾ་ཨཱཿཧཱུྃ",
+    "ཧཱུྃ་ཧཱུྃ་ཧཱུྃ",
+    "ཧཱུྃ",
+    "ན་མོ",
+    "ཨོཾ",
+    "བྷྲཱུ",
+    "རཾ་ཡཾ་ཁཾ",
+    "ཛཿཧཱུྃ་བཾ་ཧོཿ",
+}
+MAX_MANTRA_SYLLABLES = 3
+TIBETAN_ENDING_PUNCTUATION = "།༎༑༏༐༔"
+TIBSKRIT_SCRIPT = SCRIPT_DIR / "tibskrit-transliterator-cli.js"
+_TIBSKRIT_WARNING_EMITTED = False
 
 
 def collect_docx_files(paths: Iterable[str]) -> List[Path]:
@@ -120,13 +139,21 @@ def generate_phonetics_line(text: str) -> str:
     return "   ".join(phonetics_segments)
 
 
-def insert_paragraph_after(paragraph: Paragraph, text: str, style_name: str) -> Paragraph:
+def insert_phonetics_paragraph(
+    paragraph: Paragraph,
+    segments: Sequence[Tuple[str, str | None]],
+    style_name: str,
+) -> Paragraph:
     new_p = OxmlElement("w:p")
     paragraph._p.addnext(new_p)
     new_paragraph = Paragraph(new_p, paragraph._parent)
     new_paragraph.style = style_name
-    if text:
-        new_paragraph.add_run(text)
+    for text, char_style in segments:
+        if not text:
+            continue
+        run = new_paragraph.add_run(text)
+        if char_style:
+            run.style = char_style
     return new_paragraph
 
 
@@ -157,9 +184,11 @@ def process_docx(
     phonetics_style: str,
     mantra_style: str | None,
     skip_char_style: str | None,
+    mantra_char_style: str | None,
 ) -> int:
     document = Document(path)
     ensure_phonetics_style(document, phonetics_style)
+    _ensure_mantra_char_style(document, mantra_char_style)
     inserted_count = 0
     index = 0
     while True:
@@ -177,16 +206,13 @@ def process_docx(
             if next_style == phonetics_style and next_paragraph and next_paragraph.text.strip():
                 index += 2
                 continue
-            phonetics_source = _paragraph_text_for_phonetics(paragraph, skip_char_style)
-            phonetics_text = generate_phonetics_line(phonetics_source) if phonetics_source else ""
-            if phonetics_text.strip() and _needs_gyur_suffix(paragraph, skip_char_style):
-                trimmed = phonetics_text.rstrip()
-                if not trimmed.endswith(GYUR_SUFFIX):
-                    phonetics_text = trimmed + GYUR_SUFFIX
-                else:
-                    phonetics_text = trimmed
-            if phonetics_text.strip():
-                insert_paragraph_after(paragraph, phonetics_text, phonetics_style)
+            segments = _build_phonetics_segments(
+                paragraph,
+                skip_char_style,
+                mantra_char_style,
+            )
+            if segments:
+                insert_phonetics_paragraph(paragraph, segments, phonetics_style)
                 inserted_count += 1
                 index += 2
                 continue
@@ -230,6 +256,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--mantra-char-style",
+        default=DEFAULT_MANTRA_CHAR_STYLE,
+        dest="mantra_char_style",
+        help=(
+            "Character style applied to transliterated mantra prefixes (default: %(default)s). "
+            "Pass an empty string to disable styling."
+        ),
+    )
+    parser.add_argument(
         "--no-mantra",
         action="store_true",
         help="Disable mantra style check (phonetics will also be inserted before mantra paragraphs).",
@@ -241,6 +276,7 @@ def main() -> None:
     args = parse_args()
     mantra_style = None if args.no_mantra else args.mantra_style
     skip_char_style = args.skip_char_style.strip() or None
+    mantra_char_style = args.mantra_char_style.strip() or None
     ensure_perl_prerequisites()
     docx_files = collect_docx_files(args.paths)
     if not docx_files:
@@ -255,6 +291,7 @@ def main() -> None:
                 args.phonetics_style,
                 mantra_style,
                 skip_char_style,
+                mantra_char_style,
             )
             total_inserted += inserted
             print(f"{docx_path}: inserted {inserted} phonetics paragraph(s)")
@@ -287,6 +324,99 @@ def _style_name(style) -> str | None:
     return getattr(style, "name", None) or str(style)
 
 
+def _build_phonetics_segments(
+    paragraph: Paragraph,
+    skip_char_style: str | None,
+    mantra_char_style: str | None,
+) -> List[Tuple[str, str | None]]:
+    source_text = _paragraph_text_for_phonetics(paragraph, skip_char_style)
+    if not source_text.strip():
+        return []
+    mantra_prefix, remainder = _split_mantra_prefix(source_text)
+    segments: List[Tuple[str, str | None]] = []
+    if mantra_prefix:
+        mantra_phonetics = _transliterate_mantra_with_tibskrit(mantra_prefix)
+        if mantra_phonetics:
+            char_style = mantra_char_style if mantra_char_style else None
+            segments.append((mantra_phonetics.strip(), char_style))
+    rest_source = remainder if mantra_prefix else source_text
+    rest_phonetics = generate_phonetics_line(rest_source) if rest_source.strip() else ""
+    if mantra_prefix and rest_phonetics.strip():
+        segments.append(("   ", None))
+    if rest_phonetics.strip():
+        segments.append((rest_phonetics.strip(), None))
+    if segments and _needs_gyur_suffix(paragraph, skip_char_style):
+        _append_suffix_to_segments(segments, GYUR_SUFFIX)
+    return segments
+
+
+def _split_mantra_prefix(text: str) -> Tuple[str | None, str]:
+    stripped = text.strip()
+    if not stripped:
+        return None, ""
+    parts = stripped.split(None, 2)
+    if len(parts) < 2:
+        return None, stripped
+    prefix_raw = parts[0]
+    rest = stripped[len(prefix_raw):].lstrip()
+    prefix = _strip_tibetan_punctuation(prefix_raw)
+    if prefix and _is_short_mantra(prefix):
+        return prefix, rest
+    return None, stripped
+
+
+def _transliterate_mantra_with_tibskrit(text: str) -> str:
+    if not text.strip():
+        return ""
+    fallback = generate_phonetics_line(text).strip()
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp_file:
+        tmp_file.write(text)
+        tmp_path = Path(tmp_file.name)
+    command = ["node", str(TIBSKRIT_SCRIPT), str(tmp_path), "false"]
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip() or fallback
+    except (subprocess.CalledProcessError, FileNotFoundError, PermissionError) as error:
+        _emit_tibskrit_warning(error)
+        return fallback
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _emit_tibskrit_warning(error: Exception) -> None:
+    global _TIBSKRIT_WARNING_EMITTED
+    if _TIBSKRIT_WARNING_EMITTED:
+        return
+    _TIBSKRIT_WARNING_EMITTED = True
+    sys.stderr.write(
+        "Warning: tibskrit transliteration failed (" f"{error}" "). Falling back to default phonetics.\n"
+    )
+
+
+def _is_short_mantra(text: str) -> bool:
+    if text in MANTRA_PREFIXES:
+        return True
+    syllables = [part for part in text.split("་") if part.strip(TIBETAN_ENDING_PUNCTUATION + " ")]
+    return 0 < len(syllables) <= MAX_MANTRA_SYLLABLES
+
+
+def _append_suffix_to_segments(segments: List[Tuple[str, str | None]], suffix: str) -> None:
+    for index in range(len(segments) - 1, -1, -1):
+        text, style = segments[index]
+        if not text.strip():
+            continue
+        if style is None:
+            segments[index] = (text.rstrip() + suffix, style)
+            return
+    segments.append((suffix, None))
+
+
 def _needs_gyur_suffix(paragraph: Paragraph, skip_char_style: str | None) -> bool:
     if not skip_char_style:
         return False
@@ -305,6 +435,22 @@ def _needs_gyur_suffix(paragraph: Paragraph, skip_char_style: str | None) -> boo
 def _strip_tibetan_trailing_punctuation(text: str) -> str:
     stripped = text.rstrip(TIBETAN_ENDING_PUNCTUATION)
     return stripped.strip()
+
+
+def _strip_tibetan_punctuation(text: str) -> str:
+    return text.strip(TIBETAN_ENDING_PUNCTUATION + " ")
+
+
+def _ensure_mantra_char_style(document: Document, style_name: str | None) -> None:
+    if not style_name:
+        return
+    try:
+        document.styles[style_name]
+        return
+    except KeyError:
+        pass
+    style = document.styles.add_style(style_name, WD_STYLE_TYPE.CHARACTER)
+    style.font.italic = True
 
 
 if __name__ == "__main__":
