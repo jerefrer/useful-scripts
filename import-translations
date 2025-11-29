@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Import translated paragraphs (by style) from one DOCX into another and save a merged copy."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+from typing import Iterable, List
+
+try:
+    from docx import Document
+    from docx.document import Document as DocxDocument
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import _Cell, Table
+    from docx.text.paragraph import Paragraph
+except ImportError:  # pragma: no cover - CLI ergonomics only
+    print("Error: python-docx library not found.", file=sys.stderr)
+    print("Install it with: pip install python-docx", file=sys.stderr)
+    sys.exit(1)
+
+DEFAULT_TRANSLATION_STYLES = [
+    "Translation",
+    "Short Title Translation",
+    "Heading 1 Translation",
+    "Heading 2 Translation",
+    "Heading 3 Translation",
+    "Verse Phonetics",
+    "Verse Translation",
+    "Mantra Phonetics",
+    "Yigchung Translation",
+    "Yigchung Translation Solo",
+    "Yigchung Translation After",
+    "Yigchung Verse Translation",
+    "Repetition Instructions",
+    "Inserted Yigchung Translation",
+    "Inserted Verse Phonetics",
+    "Inserted Verse Translation",
+]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Replace paragraphs of a specific style in a base DOCX with those from a source DOCX,"
+            " writing the result to a new file."
+        )
+    )
+    parser.add_argument("base_doc", help="Original (English) DOCX file")
+    parser.add_argument("source_doc", help="DOCX file containing the new translations")
+    parser.add_argument("output_doc", help="Path to write the merged DOCX")
+    parser.add_argument(
+        "--style",
+        action="append",
+        dest="translation_styles",
+        help="Paragraph style to import. Can be repeated; defaults to a built-in list.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Proceed even if the number of translation paragraphs differs between the base and "
+            "source documents (default behavior is to fail)."
+        ),
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    base_path = Path(args.base_doc).expanduser()
+    source_path = Path(args.source_doc).expanduser()
+    if not base_path.is_file():
+        print(f"Error: base document not found: {base_path}", file=sys.stderr)
+        return 2
+    if not source_path.is_file():
+        print(f"Error: source document not found: {source_path}", file=sys.stderr)
+        return 2
+
+    base_doc = Document(base_path)
+    source_doc = Document(source_path)
+
+    styles = args.translation_styles if args.translation_styles else DEFAULT_TRANSLATION_STYLES
+    total_replaced = 0
+    for style_name in styles:
+        replaced = _replace_style_paragraphs(
+            base_doc,
+            source_doc,
+            style_name,
+            args.force,
+            base_path,
+            source_path,
+        )
+        if replaced is None:
+            return 3
+        total_replaced += replaced
+
+    if total_replaced == 0:
+        print("Warning: no paragraphs replaced. Check style names.", file=sys.stderr)
+
+    output_path = Path(args.output_doc).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    base_doc.save(output_path)
+    print(f"Wrote merged document to {output_path} (replaced {total_replaced} paragraph(s))")
+    return 0
+
+
+def _replace_style_paragraphs(
+    base_doc: Document,
+    source_doc: Document,
+    style_name: str,
+    allow_mismatch: bool,
+    base_path: Path,
+    source_path: Path,
+) -> int | None:
+    base_paragraphs = _remove_empty_paragraphs(_collect_style_paragraphs(base_doc, style_name))
+    source_paragraphs = _remove_empty_paragraphs(_collect_style_paragraphs(source_doc, style_name))
+
+    if not base_paragraphs and not source_paragraphs:
+        return 0
+
+    if not base_paragraphs:
+        print(
+            f"Warning: no paragraphs with style '{style_name}' found in {base_path}.",
+            file=sys.stderr,
+        )
+    if not source_paragraphs:
+        print(
+            f"Warning: no paragraphs with style '{style_name}' found in {source_path}.",
+            file=sys.stderr,
+        )
+
+    if len(base_paragraphs) != len(source_paragraphs) and not allow_mismatch:
+        print(
+            "Error: paragraph counts differ for style "
+            f"'{style_name}'. Use --force to override. Base={len(base_paragraphs)} Source={len(source_paragraphs)}",
+            file=sys.stderr,
+        )
+        return None
+
+    replacements = min(len(base_paragraphs), len(source_paragraphs))
+    for index in range(replacements):
+        _copy_paragraph_contents(base_paragraphs[index], source_paragraphs[index])
+
+    if len(base_paragraphs) != len(source_paragraphs):
+        print(
+            f"Warning: style '{style_name}' replaced {replacements} paragraph(s); base has {len(base_paragraphs)}, "
+            f"source has {len(source_paragraphs)}.",
+            file=sys.stderr,
+        )
+    return replacements
+
+
+def _collect_style_paragraphs(document: Document, style_name: str) -> List[Paragraph]:
+    matches: List[Paragraph] = []
+    for paragraph in _iter_paragraphs(document):
+        paragraph_style = paragraph.style.name if paragraph.style else ""
+        if paragraph_style == style_name:
+            matches.append(paragraph)
+    return matches
+
+
+def _iter_paragraphs(parent) -> Iterable[Paragraph]:
+    if isinstance(parent, DocxDocument):
+        container = parent.element.body
+    elif isinstance(parent, _Cell):
+        container = parent._tc
+    else:
+        container = parent
+    for child in container.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, parent)
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from _iter_paragraphs(cell)
+def _remove_empty_paragraphs(paragraphs: List[Paragraph]) -> List[Paragraph]:
+    return [paragraph for paragraph in paragraphs if not _is_empty_paragraph(paragraph)]
+
+
+def _is_empty_paragraph(paragraph: Paragraph) -> bool:
+    return not paragraph.text or not paragraph.text.strip()
+
+
+def _copy_paragraph_contents(target: Paragraph, source: Paragraph) -> None:
+    while target.runs:
+        target._element.remove(target.runs[0]._r)
+    if target.paragraph_format is not None and source.paragraph_format is not None:
+        target.paragraph_format.left_indent = source.paragraph_format.left_indent
+        target.paragraph_format.right_indent = source.paragraph_format.right_indent
+        target.paragraph_format.first_line_indent = source.paragraph_format.first_line_indent
+        target.paragraph_format.space_before = source.paragraph_format.space_before
+        target.paragraph_format.space_after = source.paragraph_format.space_after
+        target.paragraph_format.line_spacing_rule = source.paragraph_format.line_spacing_rule
+        target.paragraph_format.line_spacing = source.paragraph_format.line_spacing
+    for run in source.runs:
+        new_run = target.add_run(run.text)
+        _copy_run_formatting(new_run, run)
+
+
+def _copy_run_formatting(target_run, source_run) -> None:
+    target_run.bold = source_run.bold
+    target_run.italic = source_run.italic
+    target_run.underline = source_run.underline
+    target_run.font.name = source_run.font.name
+    target_run.font.size = source_run.font.size
+    target_run.font.color.rgb = source_run.font.color.rgb if source_run.font.color else None
+
+
+if __name__ == "__main__":
+    sys.exit(main())

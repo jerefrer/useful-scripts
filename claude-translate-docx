@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+"""Translate selected DOCX paragraph styles with Claude, optionally using translation memory."""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import sys
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence, Tuple
+import threading
+
+from anthropic import Anthropic, RateLimitError
+from docx import Document
+from docx.document import Document as DocxDocument
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.table import _Cell, Table
+from docx.text.paragraph import Paragraph
+
+try:  # pragma: no cover - optional UI enhancement
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+except ImportError:  # pragma: no cover - optional UI enhancement
+    Console = None
+    Panel = None
+    Table = None
+
+CLAUDE_MODEL = "claude-sonnet-4-5-20250929"
+MAX_TOKENS = 1200
+PROMPT_PRICE_PER_MILLION = 3.0  # USD
+COMPLETION_PRICE_PER_MILLION = 15.0  # USD
+STYLE_COLUMN_WIDTH = 26
+SPINNER_FRAMES = ["|", "/", "-", "\\"]
+MAX_PARAGRAPHS_PER_CHUNK = 24
+MIN_PARAGRAPHS_PER_OUTPUT = 4
+SENTENCE_BREAK_CHARS = (".", "!", "?")
+
+TRANSLATION_STYLES = [
+    "Translation",
+    "Short Title Translation",
+    "Heading 1 Translation",
+    "Heading 2 Translation",
+    "Heading 3 Translation",
+    "Verse Translation",
+    "Yigchung Translation",
+    "Yigchung Translation Solo",
+    "Yigchung Translation After",
+    "Yigchung Verse Translation",
+    "Repetition Instructions",
+    "Inserted Yigchung Translation",
+    "Inserted Verse Translation",
+]
+
+TRANSLATION_PROMPT = (
+    "You are a meticulous bilingual translator working on Tibetan Buddhist liturgies.\n"
+    "Instructions:\n"
+    "- Preserve the liturgical tone and register while producing natural {target_language} prose.\n"
+    "- Keep Sanskrit/Tibetan seed syllables, mantras, lineage names, Lamas, and Rinpoches exactly as given.\n"
+    "- Maintain the structure of each paragraph and keep their order identical to the input.\n"
+    "- Do not invent or merge lines; translate line-by-line.\n"
+    "- Favor idiomatic, elegant {target_language} phrasing over literal calques; rewrite awkward constructions so they sound natural while preserving meaning and devotional tone.\n"
+    "- If the English phrasing is needlessly convoluted or archaic, gently rephrase it for clarity while preserving the meaning and original tone.\n\n"
+    "Source language: {source_language}\n"
+    "Target language: {target_language}\n"
+    "Paragraph style: {style_name}\n"
+    "You will receive a JSON array of {line_count} consecutive paragraph(s) that share this style.\n"
+    "Each array element represents one paragraph, in order.\n"
+    "Translate each element faithfully and return a JSON array of exactly {line_count} strings.\n"
+    "Do not add introductions, summaries, or blank entries—every input line must map 1:1 to the output.\n"
+    "Ensure the response array preserves ordering and line count.\n\n"
+    "Source paragraphs (JSON):\n"
+    "{source_json}\n"
+)
+
+TRANSLATION_MEMORY_MAX_ENTRIES = 25
+MAX_SOURCE_CHARS = 6000
+
+
+@dataclass
+class Metrics:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    requests: int = 0
+    cost_usd: float = 0.0
+
+    def record_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
+        self.prompt_tokens += prompt_tokens
+        self.completion_tokens += completion_tokens
+        self.requests += 1
+        self.cost_usd += _calculate_cost(prompt_tokens, completion_tokens)
+
+    def live_summary(self, include_requests: bool = True) -> str:
+        parts = [
+            f"prompt_tokens={self.prompt_tokens}",
+            f"completion_tokens={self.completion_tokens}",
+            f"cost=${self.cost_usd:.4f}",
+        ]
+        if include_requests:
+            parts.insert(0, f"requests={self.requests}")
+        return ", ".join(parts)
+
+
+def _calculate_cost(prompt_tokens: int, completion_tokens: int) -> float:
+    return (
+        (prompt_tokens / 1_000_000) * PROMPT_PRICE_PER_MILLION
+        + (completion_tokens / 1_000_000) * COMPLETION_PRICE_PER_MILLION
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Translate DOCX paragraphs whose style names match a predefined list using Claude."
+        )
+    )
+    parser.add_argument(
+        "documents",
+        nargs="+",
+        help="One or more DOCX files to translate.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help=(
+            "Directory to place translated files. Defaults to the original document directory "
+            "with '-claude' appended to the filename."
+        ),
+    )
+    parser.add_argument(
+        "--translation-memory",
+        type=Path,
+        help=(
+            "Optional CSV file with approved translations (columns: source,target). Entries will "
+            "be provided to Claude as guidance."
+        ),
+    )
+    parser.add_argument(
+        "--source-language",
+        default="English",
+        help="Language of the source paragraphs (default: English).",
+    )
+    parser.add_argument(
+        "--target-language",
+        default="French",
+        help="Language to translate into (default: French).",
+    )
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="Disable fancy terminal output and fall back to plain text logging.",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="Number of times to retry Claude requests on rate limits (default: 5).",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("Error: ANTHROPIC_API_KEY environment variable is not set.", file=sys.stderr)
+        return 2
+
+    translation_memory = (
+        load_translation_memory(args.translation_memory) if args.translation_memory else []
+    )
+    if translation_memory:
+        print(f"Loaded {len(translation_memory)} translation memory entries.")
+
+    client = Anthropic(api_key=api_key)
+    use_rich = bool(Console) and not args.plain
+    console: Optional[Console] = Console() if use_rich else None
+    metrics = Metrics()
+    start_time = time.time()
+
+    if console:
+        show_header(console, args)
+
+    overall_translated = 0
+    for doc_path_str in args.documents:
+        doc_path = Path(doc_path_str).expanduser()
+        if not doc_path.is_file():
+            print(f"⚠️ Warning: skipping missing file {doc_path}", file=sys.stderr)
+            continue
+
+        output_path = determine_output_path(doc_path, args.output_dir)
+        translated = process_document(
+            doc_path,
+            output_path,
+            client,
+            translation_memory,
+            args.max_retries,
+            metrics,
+            args.source_language,
+            args.target_language,
+            console,
+        )
+        message = (
+            f"{doc_path.name}: translated {translated} paragraph(s) -> {output_path}"
+            if translated
+            else f"{doc_path.name}: no matching paragraphs found (no file written)."
+        )
+        if console:
+            console.print(f"\n[green]{message}[/green]\n")
+        else:
+            print("\n" + message + "\n")
+        overall_translated += translated
+
+    elapsed = time.time() - start_time
+    print_summary(elapsed, metrics, console)
+
+    if overall_translated == 0:
+        return 1
+    return 0
+
+
+def determine_output_path(source: Path, override_dir: Path | None) -> Path:
+    target_dir = override_dir.expanduser() if override_dir else source.parent
+    target_dir.mkdir(parents=True, exist_ok=True)
+    return target_dir / f"{source.stem}-claude{source.suffix}"
+
+
+def process_document(
+    source_path: Path,
+    output_path: Path,
+    client: Anthropic,
+    translation_memory: Sequence[Tuple[str, str]],
+    max_retries: int,
+    metrics: Metrics,
+    source_language: str,
+    target_language: str,
+    console: Optional[Console],
+) -> int:
+    document = Document(source_path)
+    translated = 0
+
+    groups = _group_style_runs(document)
+    if not groups:
+        return 0
+
+    chunk_counter = 0
+    for style_name, paragraphs in groups:
+        for chunk in _chunk_group(paragraphs, MAX_SOURCE_CHARS, MAX_PARAGRAPHS_PER_CHUNK):
+            source_lines = [paragraph.text.strip() for paragraph in chunk]
+            if not source_lines:
+                continue
+
+            chunk_counter += 1
+            chunk_index = chunk_counter
+            chunk_label = _format_chunk_label(
+                chunk_index,
+                style_name,
+                len(chunk),
+            )
+
+            with _chunk_spinner(chunk_label, console):
+                chunk_start = time.time()
+                content, prompt_tokens, completion_tokens = translate_lines(
+                    client,
+                    source_lines,
+                    style_name,
+                    translation_memory,
+                    max_retries,
+                    metrics,
+                    source_language,
+                    target_language,
+                )
+
+            new_lines = _parse_translated_lines(content)
+
+            if len(new_lines) != len(chunk):
+                mismatch_path = _write_mismatch_report(
+                    chunk_label,
+                    source_lines,
+                    new_lines,
+                )
+                print(
+                    "⚠️ Warning: Claude returned a different number of lines than requested; "
+                    f"expected {len(chunk)}, got {len(new_lines)}. Details: {mismatch_path}",
+                    file=sys.stderr,
+                )
+                continue
+
+            chunk_duration = time.time() - chunk_start
+            chunk_cost = _calculate_cost(prompt_tokens, completion_tokens)
+            chunk_message = _format_chunk_message(
+                chunk_label,
+                len(chunk),
+                chunk_duration,
+                prompt_tokens,
+                completion_tokens,
+                chunk_cost,
+                metrics.cost_usd,
+                bool(console),
+            )
+            _emit_live_message(chunk_message, console)
+
+            for paragraph, new_text in zip(chunk, new_lines):
+                paragraph.text = new_text
+                translated += 1
+
+    if translated:
+        document.save(output_path)
+    return translated
+
+
+def translate_lines(
+    client: Anthropic,
+    lines: Sequence[str],
+    style_name: str,
+    translation_memory: Sequence[Tuple[str, str]],
+    max_retries: int,
+    metrics: Metrics,
+    source_language: str,
+    target_language: str,
+) -> Tuple[str, int, int]:
+    user_prompt = build_prompt(
+        lines,
+        style_name,
+        translation_memory,
+        source_language,
+        target_language,
+    )
+    delay = 2.0
+    attempts = 0
+
+    while True:
+        try:
+            response = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=MAX_TOKENS,
+                temperature=0.2,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            usage = response.usage
+            prompt_tokens = getattr(usage, "input_tokens", 0) or 0
+            completion_tokens = getattr(usage, "output_tokens", 0) or 0
+            metrics.record_usage(prompt_tokens, completion_tokens)
+            content = _coerce_response_text(response.content[0]).strip()
+            return content, prompt_tokens, completion_tokens
+        except RateLimitError as rate_error:
+            attempts += 1
+            if attempts > max_retries:
+                raise RuntimeError("Exceeded max retries due to rate limits") from rate_error
+            print(
+                f"Rate limit encountered. Retry {attempts}/{max_retries} in {delay:.1f}s...",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+            delay *= 1.5
+        except Exception as exc:  # pragma: no cover - defensive logging
+            raise RuntimeError("Claude translation failed") from exc
+
+
+def build_prompt(
+    lines: Sequence[str],
+    style_name: str,
+    translation_memory: Sequence[Tuple[str, str]],
+    source_language: str,
+    target_language: str,
+) -> str:
+    source_json = json.dumps(list(lines), ensure_ascii=False, indent=2)
+    prompt = TRANSLATION_PROMPT.format(
+        style_name=style_name,
+        line_count=len(lines),
+        source_json=source_json,
+        source_language=source_language,
+        target_language=target_language,
+    )
+    if translation_memory:
+        prompt += "\nApproved translation memory entries (imitate when text matches or is similar):\n"
+        for source, target in translation_memory[:TRANSLATION_MEMORY_MAX_ENTRIES]:
+            prompt += f"- \"{source}\" => \"{target}\"\n"
+        if len(translation_memory) > TRANSLATION_MEMORY_MAX_ENTRIES:
+            prompt += "- ... (additional entries omitted for brevity)\n"
+    prompt += (
+        "\nRespond ONLY with a JSON array of {line_count} strings (example: [\"line1\", \"line2\"])."
+        " Do not wrap the JSON in markdown fences or add commentary."
+    ).format(line_count=len(lines))
+    return prompt
+
+
+def _format_chunk_message(
+    chunk_label: str,
+    paragraph_count: int,
+    seconds: float,
+    prompt_tokens: int,
+    completion_tokens: int,
+    chunk_cost: float,
+    total_cost: float,
+    use_color: bool,
+) -> str:
+    label_text = _colorize_paragraphs_label(chunk_label, paragraph_count, use_color)
+    processing_field = _format_stat(
+        "processing time:",
+        f"{seconds:>5.1f}s",
+        "cyan",
+        use_color,
+    )
+    prompt_field = _format_stat(
+        "prompt tokens:",
+        f"{prompt_tokens:>5d}",
+        "green",
+        use_color,
+    )
+    completion_field = _format_stat(
+        "completion tokens:",
+        f"{completion_tokens:>5d}",
+        "green",
+        use_color,
+    )
+    cost_field = _format_stat(
+        "cost:",
+        f"${chunk_cost:>7.4f}",
+        "yellow",
+        use_color,
+    )
+    total_field = _format_total_field(total_cost, use_color)
+    return (
+        f"✅ {label_text} | {processing_field} | {prompt_field} | "
+        f"{completion_field} | {cost_field} {total_field}"
+    )
+
+
+def _format_chunk_label(index: int, style_name: str, paras: int) -> str:
+    style_display = style_name
+    if len(style_display) > STYLE_COLUMN_WIDTH:
+        style_display = style_display[: STYLE_COLUMN_WIDTH - 1] + "…"
+    style_block = f"[{style_display:<{STYLE_COLUMN_WIDTH}}]"
+    return f"Chunk {index:03d} {style_block} | paragraphs: {paras:>3d}"
+
+
+def _colorize_paragraphs_label(label: str, paragraph_count: int, use_color: bool) -> str:
+    if not use_color:
+        return label
+    prefix, sep, _ = label.partition("paragraphs:")
+    if not sep:
+        return label
+    colored = f"[magenta]paragraphs:[/] {paragraph_count:>3d}"
+    return f"{prefix}{sep.replace('paragraphs:', '')}{colored}"
+
+
+def _format_stat(label: str, value: str, color: str, use_color: bool) -> str:
+    if use_color:
+        return f"[{color}]{label}[/{color}] {value}"
+    return f"{label} {value}"
+
+
+def _format_total_field(total_cost: float, use_color: bool) -> str:
+    total_text = f"(total ${total_cost:>7.4f})"
+    if use_color:
+        return f"[bold yellow]{total_text}[/bold yellow]"
+    return total_text
+
+
+def print_summary(elapsed_seconds: float, metrics: Metrics, console: Optional[Console]) -> None:
+    minutes, seconds = divmod(elapsed_seconds, 60)
+    summary_lines = [
+        f"Elapsed time: {int(minutes)}m {seconds:.1f}s",
+        f"Requests: {metrics.requests}",
+        f"Prompt tokens: {metrics.prompt_tokens}",
+        f"Completion tokens: {metrics.completion_tokens}",
+        f"Estimated cost: ${metrics.cost_usd:.4f}",
+    ]
+    summary_text = "\n\n".join(summary_lines)
+    if console:
+        table = Table(title="Translation Summary")
+        table.add_column("Metric", justify="right", style="cyan", no_wrap=True)
+        table.add_column("Value", style="magenta")
+        table.add_row("Elapsed time", summary_lines[0].split(": ")[1])
+        table.add_row("Requests", str(metrics.requests))
+        table.add_row("Prompt tokens", str(metrics.prompt_tokens))
+        table.add_row("Completion tokens", str(metrics.completion_tokens))
+        table.add_row("Estimated cost", f"${metrics.cost_usd:.4f}")
+        console.print(table)
+    else:
+        print("\n=== Translation Summary ===\n\n" + summary_text + "\n")
+
+
+def show_header(console: Console, args: argparse.Namespace) -> None:
+    panel = Panel(
+        f"Model: [bold]{CLAUDE_MODEL}[/bold]\n"
+        f"Source: [bold]{args.source_language}[/bold] → Target: [bold]{args.target_language}[/bold]\n"
+        f"Files: [bold]{len(args.documents)}[/bold]",
+        title="Claude Translation",
+        border_style="blue",
+    )
+    console.print(panel)
+
+def _emit_live_message(message: str, console: Optional[Console]) -> None:
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    formatted = f"[{timestamp}] {message}" if console is None else message
+    if console:
+        console.print(formatted)
+    else:
+        print(formatted, file=sys.stderr)
+
+
+@contextmanager
+def _chunk_spinner(base_message: str, console: Optional[Console]):
+    if console:
+        status = console.status(f" [cyan]{base_message} | working…[/cyan]", spinner="dots")
+        status.start()
+        try:
+            yield
+        finally:
+            status.stop()
+    else:
+        stop_event = threading.Event()
+        spinner_thread = threading.Thread(
+            target=_plain_spinner,
+            args=(base_message, stop_event),
+            daemon=True,
+        )
+        spinner_thread.start()
+        try:
+            yield
+        finally:
+            stop_event.set()
+            spinner_thread.join()
+            sys.stderr.write("\r")
+            sys.stderr.flush()
+
+
+def load_translation_memory(csv_path: Path) -> List[Tuple[str, str]]:
+    csv_path = csv_path.expanduser()
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"Translation memory file not found: {csv_path}")
+
+    with csv_path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        rows = list(reader)
+
+
+def _plain_spinner(base_message: str, stop_event: threading.Event) -> None:
+    frame_index = 0
+    while not stop_event.is_set():
+        frame = SPINNER_FRAMES[frame_index % len(SPINNER_FRAMES)]
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        sys.stderr.write(
+            f"\r[{timestamp}] {base_message} | working {frame}"
+        )
+        sys.stderr.flush()
+        time.sleep(0.15)
+        frame_index += 1
+
+    if not rows:
+        return []
+
+    header = rows[0]
+    data_rows = rows[1:] if _row_looks_like_header(header) else rows
+
+    if len(header) < 2 and _row_looks_like_header(header):
+        raise ValueError("Translation memory CSV must have at least two columns.")
+
+    entries: List[Tuple[str, str]] = []
+    for row in data_rows:
+        if len(row) < 2:
+            continue
+        source, target = row[0].strip(), row[1].strip()
+        if source and target:
+            entries.append((source, target))
+    return entries
+
+
+def _write_debug_payload(content: str) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    debug_dir = Path.cwd() / "claude-debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    debug_path = debug_dir / f"raw-response-{timestamp}.txt"
+    debug_path.write_text(content, encoding="utf-8")
+    return debug_path
+
+
+def _write_mismatch_report(
+    chunk_label: str,
+    source_lines: Sequence[str],
+    output_lines: Sequence[str],
+) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    report_dir = Path.cwd() / "claude-debug"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / f"mismatch-{timestamp}.txt"
+    with report_path.open("w", encoding="utf-8") as handle:
+        handle.write(f"{chunk_label}\n")
+        handle.write("Expected lines:\n")
+        for idx, line in enumerate(source_lines, start=1):
+            handle.write(f"  [{idx:02d}] {line}\n")
+        handle.write("\nReturned lines:\n")
+        for idx, line in enumerate(output_lines, start=1):
+            handle.write(f"  [{idx:02d}] {line}\n")
+    return report_path
+
+
+def _parse_translated_lines(content: str) -> List[str]:
+    if isinstance(content, list):
+        return [str(line).strip() for line in content]
+    if not isinstance(content, str):
+        content = str(content)
+
+    for candidate in (content, _sanitize_json_array(content)):
+        if candidate is None:
+            continue
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, list):
+            return [str(line).strip() for line in data]
+
+    recovered = _recover_translation_array(content)
+    if recovered is not None:
+        return recovered
+
+    debug_path = _write_debug_payload(content)
+    preview = content[:500].replace("\n", " ")
+    raise RuntimeError(
+        "Claude response was not valid JSON. "
+        f"Saved raw output to {debug_path}. Preview: {preview}"
+    )
+
+
+def _recover_translation_array(content: str) -> Optional[List[str]]:
+    match = re.search(r"\[(.*)\]", content, re.DOTALL)
+    snippet = match.group(0) if match else content
+    lines = []
+    current = []
+    in_quote = False
+    escaped = False
+    for char in snippet:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            current.append(char)
+            continue
+        if char == '"':
+            in_quote = not in_quote
+            current.append(char)
+            continue
+        if not in_quote and char == ',':
+            entry = "".join(current).strip()
+            if entry:
+                try:
+                    decoded = json.loads(entry if entry.startswith('"') else f'"{entry.strip("\"")}"')
+                except json.JSONDecodeError:
+                    decoded = entry.strip('" ')
+                lines.append(decoded.strip())
+            current = []
+            continue
+        current.append(char)
+    tail = "".join(current).strip()
+    if tail:
+        try:
+            decoded = json.loads(tail if tail.startswith('"') else f'"{tail.strip("\"")}"')
+        except json.JSONDecodeError:
+            decoded = tail.strip('" ')
+        lines.append(decoded.strip())
+
+    cleaned = [line for line in lines if line]
+    return cleaned or None
+
+
+def _sanitize_json_array(content: str) -> Optional[str]:
+    sanitized = re.sub(r",\s*\"\"\s*,", '",', content)
+    sanitized = re.sub(r',\s*\"\"\s*\]', '"]', sanitized)
+    sanitized = re.sub(r',\s*\]', ', ]', sanitized)
+    return sanitized if sanitized != content else None
+
+
+def _coerce_response_text(block) -> str:
+    if hasattr(block, "text") and isinstance(block.text, str):
+        return block.text
+    if isinstance(block, str):
+        return block
+    if isinstance(block, list):
+        return "\n".join(str(part) for part in block)
+    return str(block)
+
+
+def _row_looks_like_header(row: Sequence[str]) -> bool:
+    combined = " ".join(cell.lower() for cell in row)
+    return "source" in combined or "target" in combined or "translation" in combined
+
+
+def _iter_paragraphs(parent) -> Iterable[Paragraph]:
+    if isinstance(parent, DocxDocument):
+        container = parent.element.body
+    elif isinstance(parent, _Cell):
+        container = parent._tc
+    else:
+        container = parent
+
+    for child in container.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, parent)
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from _iter_paragraphs(cell)
+
+
+def _group_style_runs(document: Document) -> List[Tuple[str, List[Paragraph]]]:
+    groups: List[Tuple[str, List[Paragraph]]] = []
+    current_style: str | None = None
+    current_paragraphs: List[Paragraph] = []
+
+    for paragraph in _iter_paragraphs(document):
+        style_name = paragraph.style.name if paragraph.style else ""
+        has_text = bool(paragraph.text and paragraph.text.strip())
+        if style_name in TRANSLATION_STYLES and has_text:
+            if current_paragraphs and style_name == current_style:
+                current_paragraphs.append(paragraph)
+            else:
+                if current_paragraphs:
+                    groups.append((current_style or "", current_paragraphs))
+                current_paragraphs = [paragraph]
+                current_style = style_name
+        else:
+            # Non-translatable paragraphs neither end nor start groups; we simply skip them
+            continue
+
+    if current_paragraphs:
+        groups.append((current_style or "", current_paragraphs))
+
+    return groups
+
+
+def _chunk_group(
+    paragraphs: Sequence[Paragraph],
+    max_chars: int,
+    max_paragraphs: int,
+) -> Iterable[List[Paragraph]]:
+    chunk: List[Paragraph] = []
+    chunk_lengths: List[int] = []
+    char_count = 0
+    break_indices: List[int] = []
+
+    for paragraph in paragraphs:
+        raw_text = paragraph.text or ""
+        text = raw_text.strip()
+        if not text:
+            if chunk:
+                break_indices.append(len(chunk))
+            continue
+
+        text_length = len(text)
+        while chunk and (char_count + text_length > max_chars or len(chunk) >= max_paragraphs):
+            split_idx = _select_split_index(len(chunk), break_indices)
+            yield chunk[:split_idx]
+            removed_lengths = sum(chunk_lengths[:split_idx])
+            chunk = chunk[split_idx:]
+            chunk_lengths = chunk_lengths[split_idx:]
+            char_count -= removed_lengths
+            break_indices = [idx - split_idx for idx in break_indices if idx - split_idx > 0]
+
+        chunk.append(paragraph)
+        chunk_lengths.append(text_length)
+        char_count += text_length
+        if _paragraph_ends_sentence(raw_text):
+            break_indices.append(len(chunk))
+
+    if chunk:
+        yield chunk
+
+
+def _select_split_index(chunk_len: int, break_indices: List[int]) -> int:
+    for idx in reversed(break_indices):
+        if MIN_PARAGRAPHS_PER_OUTPUT <= idx < chunk_len - MIN_PARAGRAPHS_PER_OUTPUT:
+            return idx
+    fallback = max(MIN_PARAGRAPHS_PER_OUTPUT, chunk_len // 2)
+    fallback = min(chunk_len - MIN_PARAGRAPHS_PER_OUTPUT, fallback)
+    if fallback <= 0:
+        return max(1, chunk_len - MIN_PARAGRAPHS_PER_OUTPUT)
+    return fallback
+
+
+def _paragraph_ends_sentence(text: str) -> bool:
+    stripped = (text or "").rstrip()
+    if not stripped:
+        return True
+    return stripped.endswith(SENTENCE_BREAK_CHARS)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
