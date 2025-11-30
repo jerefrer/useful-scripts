@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Copy "Verse Phonetics" paragraphs from a source DOCX tree into matching destination files."""
+
+from __future__ import annotations
+
+import argparse
+from copy import deepcopy
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Iterator, List, Sequence, Tuple
+
+try:
+    from docx import Document
+    from docx.document import Document as DocxDocument
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import _Cell, Table
+    from docx.text.paragraph import Paragraph
+except ImportError:  # pragma: no cover - CLI ergonomics only
+    print("Error: python-docx library not found.", file=sys.stderr)
+    print("Install it with: pip install python-docx", file=sys.stderr)
+    sys.exit(1)
+
+DOCX_SUFFIX = ".docx"
+TEMP_PREFIX = "~$"
+DEFAULT_STYLE = "Verse Phonetics"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "For each DOCX in SOURCE that also exists in DESTINATION, copy the text of "
+            "paragraphs styled as Verse Phonetics from the source into the destination file."
+        )
+    )
+    parser.add_argument(
+        "source",
+        type=Path,
+        help="Folder containing the authoritative DOCX files.",
+    )
+    parser.add_argument(
+        "destination",
+        type=Path,
+        help="Folder containing the DOCX files to update (same relative paths as source).",
+    )
+    parser.add_argument(
+        "--style",
+        default=DEFAULT_STYLE,
+        help=f"Paragraph style to sync (default: {DEFAULT_STYLE}).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show which files would change without saving destination documents.",
+    )
+    parser.add_argument(
+        "--non-recursive",
+        action="store_true",
+        help="Only consider DOCX files directly inside the source folder (no subdirectories).",
+    )
+    return parser.parse_args()
+
+
+@dataclass
+class SyncStats:
+    updated_files: int = 0
+    updated_paragraphs: int = 0
+    warnings: int = 0
+
+
+def main() -> int:
+    args = parse_args()
+    source_root = args.source.expanduser()
+    dest_root = args.destination.expanduser()
+
+    if not source_root.is_dir():
+        print(f"Error: source path {source_root} is not a directory.", file=sys.stderr)
+        return 2
+    if not dest_root.is_dir():
+        print(f"Error: destination path {dest_root} is not a directory.", file=sys.stderr)
+        return 2
+
+    pairs = collect_matching_pairs(source_root, dest_root, recursive=not args.non_recursive)
+    if not pairs:
+        print("No matching DOCX files found to process.")
+        return 1
+
+    stats = SyncStats()
+    for src_path, dst_path in pairs:
+        try:
+            changed, warnings = sync_document(src_path, dst_path, args.style, args.dry_run)
+        except Exception as error:  # pragma: no cover - defensive logging
+            print(f"Error syncing {src_path} -> {dst_path}: {error}", file=sys.stderr)
+            stats.warnings += 1
+            continue
+        if changed:
+            stats.updated_files += 1
+            stats.updated_paragraphs += changed
+        stats.warnings += warnings
+
+    print(
+        f"Finished. {stats.updated_paragraphs} paragraph(s) copied across "
+        f"{stats.updated_files} file(s)."
+    )
+    if stats.warnings:
+        print(f"Encountered {stats.warnings} warning(s); see log above for details.")
+    if stats.updated_paragraphs == 0:
+        return 1
+    return 0
+
+
+def collect_matching_pairs(
+    source_root: Path, dest_root: Path, *, recursive: bool
+) -> List[Tuple[Path, Path]]:
+    pairs: List[Tuple[Path, Path]] = []
+    iterator: Iterable[Path]
+    if recursive:
+        iterator = source_root.rglob(f"*{DOCX_SUFFIX}")
+    else:
+        iterator = source_root.glob(f"*{DOCX_SUFFIX}")
+
+    for source_path in sorted(iterator):
+        if not _is_valid_docx(source_path):
+            continue
+        try:
+            relative = source_path.relative_to(source_root)
+        except ValueError:
+            # Should not occur, but guard anyway
+            continue
+        destination_path = dest_root / relative
+        if destination_path.is_file():
+            pairs.append((source_path, destination_path))
+        else:
+            print(
+                f"Warning: destination file missing for {relative} (looked for {destination_path}).",
+                file=sys.stderr,
+            )
+    return pairs
+
+
+def _is_valid_docx(path: Path) -> bool:
+    return path.suffix.lower() == DOCX_SUFFIX and not path.name.startswith(TEMP_PREFIX)
+
+
+def sync_document(
+    source_path: Path, destination_path: Path, style_name: str, dry_run: bool
+) -> Tuple[int, int]:
+    source_doc = Document(source_path)
+    destination_doc = Document(destination_path)
+
+    source_paragraphs = list(_iter_style_paragraphs(source_doc, style_name))
+    dest_paragraphs = list(_iter_style_paragraphs(destination_doc, style_name))
+
+    if not source_paragraphs:
+        print(f"Warning: no '{style_name}' paragraphs in {source_path}", file=sys.stderr)
+    if not dest_paragraphs:
+        print(f"Warning: no '{style_name}' paragraphs in {destination_path}", file=sys.stderr)
+
+    if len(source_paragraphs) != len(dest_paragraphs):
+        print(
+            f"Warning: paragraph count mismatch for style '{style_name}' in {source_path.name} "
+            f"(source={len(source_paragraphs)}, destination={len(dest_paragraphs)}). No changes applied.",
+            file=sys.stderr,
+        )
+        return 0, 1
+
+    copied = 0
+    for source_paragraph, dest_paragraph in zip(source_paragraphs, dest_paragraphs):
+        if not _paragraphs_equal(source_paragraph, dest_paragraph):
+            _copy_paragraph_contents(source_paragraph, dest_paragraph)
+            copied += 1
+
+    if copied and not dry_run:
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        destination_doc.save(destination_path)
+        print(f"Updated {destination_path} ({copied} paragraph(s) copied)")
+    elif copied and dry_run:
+        print(f"[dry-run] Would update {destination_path} ({copied} paragraph(s) copied)")
+
+    return copied, 0
+
+
+def _iter_style_paragraphs(document: Document, style_name: str) -> Iterator[Paragraph]:
+    for paragraph in _iter_paragraphs(document):
+        if paragraph.style is not None and paragraph.style.name == style_name:
+            yield paragraph
+
+
+def _iter_paragraphs(parent) -> Iterator[Paragraph]:
+    if isinstance(parent, DocxDocument):
+        container = parent.element.body
+    elif isinstance(parent, _Cell):
+        container = parent._tc
+    else:
+        container = parent
+    for child in container.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, parent)
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from _iter_paragraphs(cell)
+
+
+def _paragraphs_equal(source: Paragraph, destination: Paragraph) -> bool:
+    return source.text == destination.text
+
+
+def _copy_paragraph_contents(source: Paragraph, destination: Paragraph) -> None:
+    dest_element = destination._p
+    for child in list(dest_element):
+        dest_element.remove(child)
+    for child in source._p:
+        dest_element.append(deepcopy(child))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

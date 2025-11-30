@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""Interactively inspect "Verse Phonetics" paragraphs for attached particles.
+
+For each supplied DOCX file, this script walks through pairs of paragraphs
+styled as "Verse Tibetan" followed by "Verse Phonetics". Whenever a Verse
+Phonetics line contains the particles "tang", "kyi", "gyi", or "yi"
+attached to adjacent text (e.g., "martang", "tangmar"), the user is prompted
+to insert spaces so the particle stands alone, but only when the corresponding
+Tibetan marker (e.g., "་དང", "་ཀྱི", "་གི", "་ཡི") is present in the paired
+Verse Tibetan line and immediately followed by "་", "་", "༔", "།", or a
+space. Multiple issues in the same paragraph are handled sequentially.
+
+By default, edited files are written next to the originals using the suffix
+"-phonetics". Use --in-place to overwrite the originals or --output-dir to
+redirect the results elsewhere.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence
+
+try:
+    from docx import Document
+    from docx.document import Document as DocxDocument
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import _Cell, Table
+    from docx.text.paragraph import Paragraph
+except ImportError:  # pragma: no cover - CLI ergonomics only
+    print("Error: python-docx library not found.", file=sys.stderr)
+    print("Install it with: pip install python-docx", file=sys.stderr)
+    sys.exit(1)
+
+VERSE_TIBETAN_STYLE = "Verse Tibetan"
+VERSE_PHONETICS_STYLE = "Verse Phonetics"
+TARGET_TOKENS = ("tang", "kyi", "gyi", "ki", "gi", "yi")
+ALLOWED_FOLLOWING_CHARS = {"་", "༔", "།", " "}
+PROTECTED_TIBETAN_PHRASES = ("དབང་དང་", "དང་པོ་", "དང་པོའི་", "དང་པོས་", "ཡི་དམ་")
+TOKEN_TIBETAN_MARKERS = {
+    "tang": ("་དང",),
+    "kyi": ("་གྱི", "་ཀྱིས", "་གྱིས", "་གིས"),
+    "gyi": ("་གྱི", "་ཀྱིས", "་གྱིས", "་གིས"),
+    "ki": ("་ཀྱི", "་གི"),
+    "gi": ("་ཀྱི", "་གི"),
+    "yi": ("་ཡི",),
+}
+
+
+@dataclass
+class Args:
+    documents: List[Path]
+    in_place: bool
+    output_dir: Optional[Path]
+    suffix: str
+
+
+@dataclass
+class MarkerMatch:
+    start: int
+    end: int
+    marker: str
+
+
+class UserAbort(Exception):
+    """Raised when the user elects to stop the inspection early."""
+
+
+@dataclass
+class Issue:
+    start: int
+    end: int
+    token: str
+    actual_token: str
+    before_attached: bool
+    after_attached: bool
+    word_start: int
+    word_end: int
+    source_text: str
+
+
+def parse_args() -> Args:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Inspect DOCX Verse Phonetics paragraphs for attached particles and "
+            "optionally insert spaces so the particles stand alone."
+        )
+    )
+    parser.add_argument(
+        "documents",
+        nargs="+",
+        type=Path,
+        help="One or more DOCX files or directories (searched recursively) to inspect.",
+    )
+    parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="Overwrite the original DOCX files instead of writing suffixed copies.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Optional directory for edited copies (ignored when --in-place is set).",
+    )
+    parser.add_argument(
+        "--suffix",
+        default="-phonetics",
+        help=(
+            "Suffix appended to the filename when writing edited copies (default: -phonetics). "
+            "Ignored with --in-place."
+        ),
+    )
+    parsed = parser.parse_args()
+    return Args(
+        documents=[path.expanduser() for path in parsed.documents],
+        in_place=parsed.in_place,
+        output_dir=parsed.output_dir.expanduser() if parsed.output_dir else None,
+        suffix=parsed.suffix,
+    )
+
+
+def main() -> int:
+    args = parse_args()
+    processed_any = False
+    try:
+        for doc_path in iter_input_docx(args.documents):
+            processed_any = True
+            print(f"\n=== Inspecting {doc_path} ===")
+            document = Document(doc_path)
+            changed, aborted = process_document(document, doc_path)
+            if changed:
+                target_path = determine_output_path(doc_path, args)
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                document.save(target_path)
+                print(f"Saved edits to {target_path}")
+            else:
+                print("No changes made.")
+            if aborted:
+                print("Inspection aborted by user.")
+                return 1
+    except UserAbort:
+        print("\nInspection aborted by user.")
+        return 1
+    if not processed_any:
+        print("No DOCX files found to inspect.", file=sys.stderr)
+        return 1
+    return 0
+
+
+def iter_input_docx(paths: Sequence[Path]) -> Iterable[Path]:
+    for path in paths:
+        expanded = path.expanduser()
+        if not expanded.exists():
+            print(f"Warning: skipping missing path {expanded}", file=sys.stderr)
+            continue
+        if expanded.is_dir():
+            docx_files = sorted(p for p in expanded.rglob("*.docx") if p.is_file())
+            if not docx_files:
+                print(f"Warning: no DOCX files found under {expanded}", file=sys.stderr)
+            for docx_file in docx_files:
+                yield docx_file
+            continue
+        if expanded.is_file():
+            if expanded.suffix.lower() != ".docx":
+                print(f"Warning: skipping non-DOCX file {expanded}", file=sys.stderr)
+                continue
+            yield expanded
+            continue
+        print(f"Warning: skipping unsupported path {expanded}", file=sys.stderr)
+
+
+def determine_output_path(source: Path, args: Args) -> Path:
+    if args.in_place:
+        return source
+    if args.output_dir:
+        return args.output_dir / source.name
+    return source.with_name(f"{source.stem}{args.suffix}{source.suffix}")
+
+
+def process_document(document: Document, doc_path: Path) -> tuple[bool, bool]:
+    """Return (changed, aborted)."""
+    changed = False
+    tibetan_buffer: Optional[str] = None
+    paragraph_counter = 0
+
+    for paragraph in _iter_paragraphs(document):
+        paragraph_counter += 1
+        style_name = paragraph.style.name if paragraph.style else ""
+        if style_name == VERSE_TIBETAN_STYLE:
+            tibetan_buffer = paragraph.text.strip()
+            continue
+        if style_name != VERSE_PHONETICS_STYLE:
+            continue
+
+        try:
+            paragraph_changed = review_phonetics_paragraph(
+                paragraph,
+                tibetan_buffer,
+                doc_path,
+                paragraph_counter,
+            )
+        except UserAbort:
+            if paragraph.text != paragraph.text:  # pragma: no cover - defensive
+                pass
+            return changed, True
+
+        if paragraph_changed:
+            changed = True
+
+    return changed, False
+
+
+def review_phonetics_paragraph(
+    paragraph: Paragraph,
+    tibetan_text: Optional[str],
+    doc_path: Path,
+    paragraph_number: int,
+) -> bool:
+    original_text = paragraph.text
+    text = paragraph.text
+    start_index = 0
+    displayed_header = False
+    history: List[tuple[str, int]] = []
+
+    while True:
+        issue = find_next_issue(text, start_index)
+        if issue is None:
+            break
+        should_prompt, marker_match = evaluate_tibetan_context(issue, tibetan_text)
+        if not should_prompt:
+            start_index = issue.end
+            continue
+        if not displayed_header:
+            print("\n---")
+            print(f"Document: {doc_path}")
+            print(f"Paragraph #{paragraph_number}")
+            displayed_header = True
+
+        print("Verse Tibetan (matching marker highlighted):")
+        print(format_tibetan_display(tibetan_text, marker_match))
+        print("Verse Phonetics (problem token highlighted):")
+        print(format_phonetics_display(text, issue))
+
+        preview = build_preview(issue)
+        decision = prompt_user(issue, preview)
+        if decision == "quit":
+            raise UserAbort()
+        if decision == "skip":
+            print("Skipping remaining issues in this paragraph.")
+            break
+        if decision == "yes":
+            history.append((text, start_index))
+            text, start_index = apply_fix(text, issue)
+            continue
+        if decision == "undo":
+            if history:
+                text, start_index = history.pop()
+                print("Reverted to previous state.")
+            else:
+                print("No previous edits to undo.")
+            continue
+        # decision == "no"
+        start_index = issue.end
+
+    paragraph.text = text
+    return text != original_text
+
+
+@dataclass
+class Issue:
+    start: int
+    end: int
+    token: str
+    actual_token: str
+    before_attached: bool
+    after_attached: bool
+    word_start: int
+    word_end: int
+    source_text: str
+
+
+def find_next_issue(text: str, start_index: int) -> Optional[Issue]:
+    lowered = text.lower()
+    search_pos = start_index
+    while search_pos < len(text):
+        next_match: Optional[Issue] = None
+        next_pos: Optional[int] = None
+        for token in TARGET_TOKENS:
+            idx = lowered.find(token, search_pos)
+            if idx == -1:
+                continue
+            if token == "yi" and _is_embedded_in_kyi_gyi(text, idx):
+                search_pos = idx + 1
+                continue
+            before_attached = idx > 0 and _is_letter(text[idx - 1])
+            after_index = idx + len(token)
+            after_attached = after_index < len(text) and _is_letter(text[after_index])
+            if not before_attached and not after_attached:
+                continue
+            if next_pos is None or idx < next_pos:
+                word_start, word_end = expand_word_boundaries(text, idx, after_index)
+                next_pos = idx
+                next_match = Issue(
+                    start=idx,
+                    end=after_index,
+                    token=token,
+                    actual_token=text[idx:after_index],
+                    before_attached=before_attached,
+                    after_attached=after_attached,
+                    word_start=word_start,
+                    word_end=word_end,
+                    source_text=text,
+                )
+        if next_match:
+            return next_match
+        break
+    return None
+
+
+def apply_fix(text: str, issue: Issue) -> tuple[str, int]:
+    start = issue.start
+    end = issue.end
+    if issue.before_attached:
+        text = text[:start] + " " + text[start:]
+        start += 1
+        end += 1
+    if issue.after_attached:
+        text = text[:end] + " " + text[end:]
+        end += 1
+    new_start = start + len(issue.token)
+    if issue.after_attached:
+        new_start += 1
+    return text, new_start
+
+
+def build_preview(issue: Issue) -> str:
+    word = issue_word(issue)
+    token_text = issue.actual_token
+    before = word[: issue.start - issue.word_start]
+    after = word[issue.end - issue.word_start :]
+    pieces = [before]
+    if issue.before_attached:
+        pieces.append(" ")
+    pieces.append(token_text)
+    if issue.after_attached:
+        pieces.append(" ")
+    pieces.append(after)
+    suggested = "".join(pieces)
+    return f"{word} -> {suggested}"
+
+
+def issue_word(issue: Issue) -> str:
+    return issue_span_text(issue, issue.word_start, issue.word_end)
+
+
+def issue_span_text(issue: Issue, start: int, end: int) -> str:
+    return issue.source_text[start:end]
+
+
+def _prompt_decision(prompt: str) -> str:
+    response = _read_single_keypress(prompt)
+    if response is None:
+        response = input(prompt)
+    return response.strip().lower()
+
+
+def _read_single_keypress(prompt: str) -> Optional[str]:
+    stream = sys.stdin
+    if not stream.isatty():
+        return None
+    # Try POSIX raw mode first.
+    try:
+        import termios  # type: ignore
+        import tty  # type: ignore
+
+        fd = stream.fileno()
+        old_settings = termios.tcgetattr(fd)
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        try:
+            tty.setraw(fd)
+            ch = stream.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    except (ImportError, AttributeError, termios.error):  # type: ignore[name-defined]
+        # Fall back to Windows msvcrt if available.
+        try:
+            import msvcrt  # type: ignore
+        except ImportError:
+            return None
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        ch = msvcrt.getwch()
+        if ch == "\r":
+            ch = "\n"
+    else:
+        if ch == "\r":
+            ch = "\n"
+        if ch == "\x03":
+            raise KeyboardInterrupt
+    _echo_keypress(ch)
+    return "" if ch == "\n" else ch
+
+
+def _echo_keypress(ch: str) -> None:
+    if ch == "\n":
+        sys.stdout.write("\n")
+    else:
+        sys.stdout.write(ch + "\n")
+    sys.stdout.flush()
+
+
+def evaluate_tibetan_context(
+    issue: Issue, tibetan_text: Optional[str]
+) -> tuple[bool, Optional[MarkerMatch]]:
+    markers = TOKEN_TIBETAN_MARKERS.get(issue.token)
+    if not markers:
+        return True, None
+    if not tibetan_text:
+        return False, None
+    for phrase in PROTECTED_TIBETAN_PHRASES:
+        if phrase in tibetan_text:
+            return False, None
+    for marker in markers:
+        idx = tibetan_text.find(marker)
+        while idx != -1:
+            after_idx = idx + len(marker)
+            next_char = tibetan_text[after_idx] if after_idx < len(tibetan_text) else ""
+            if next_char in ALLOWED_FOLLOWING_CHARS:
+                return True, MarkerMatch(idx, after_idx, marker)
+            idx = tibetan_text.find(marker, idx + 1)
+    return False, None
+
+
+def format_tibetan_display(
+    tibetan_text: Optional[str], marker_match: Optional[MarkerMatch]
+) -> str:
+    if tibetan_text is None:
+        return "(no preceding Verse Tibetan paragraph)"
+    if not tibetan_text.strip():
+        return "(empty)"
+    if not marker_match:
+        return tibetan_text
+    if not _supports_color():
+        return tibetan_text
+    return (
+        tibetan_text[: marker_match.start]
+        + _colorize(tibetan_text[marker_match.start : marker_match.end], style="tibetan")
+        + tibetan_text[marker_match.end :]
+    )
+
+
+def format_phonetics_display(text: str, issue: Issue) -> str:
+    content = text or "(empty)"
+    if not text or not _supports_color():
+        return content
+    return (
+        text[: issue.start]
+        + _colorize(text[issue.start : issue.end], style="phonetic")
+        + text[issue.end :]
+    )
+
+
+def expand_word_boundaries(text: str, start: int, end: int) -> tuple[int, int]:
+    left = start
+    while left > 0 and not text[left - 1].isspace():
+        left -= 1
+    right = end
+    text_len = len(text)
+    while right < text_len and not text[right].isspace():
+        right += 1
+    return left, right
+
+
+def _is_embedded_in_kyi_gyi(text: str, idx: int) -> bool:
+    if idx <= 0:
+        return False
+    prev = text[idx - 1].lower()
+    if prev in {"k", "g"}:
+        return True
+    if idx >= 2:
+        pair = text[idx - 2 : idx].lower()
+        if pair in {"kh", "gh"}:
+            return True
+    return False
+
+
+def _supports_color() -> bool:
+    stream = sys.stdout
+    if not stream.isatty():
+        return False
+    term = os.environ.get("TERM", "")
+    return term != "dumb"
+
+
+def _colorize(text: str, *, style: str) -> str:
+    if style == "tibetan":
+        color = "[38;5;213m"  # bright magenta
+    elif style == "phonetic":
+        color = "[38;5;81m"  # cyan
+    else:
+        color = "[1m"
+    reset = "[0m"
+    return f"{color}{text}{reset}"
+
+
+def prompt_user(issue: Issue, preview: str) -> str:
+    before = issue.before_attached
+    after = issue.after_attached
+    attachment_desc = []
+    if before:
+        attachment_desc.append("attached to the previous syllable")
+    if after:
+        attachment_desc.append("attached to the following syllable")
+    description = " and ".join(attachment_desc)
+    if not description:
+        description = "attached"
+
+    print(f"\nProblematic token: '{issue.actual_token}' ({description})")
+    print(f"Suggested split: {preview}")
+    prompt = "Apply change? [Y/n/s/q/b]: "
+    while True:
+        response = _prompt_decision(prompt)
+        if response in {"", "y", "yes"}:
+            return "yes"
+        if response in {"n", "no"}:
+            return "no"
+        if response in {"s", "skip"}:
+            return "skip"
+        if response in {"q", "quit"}:
+            return "quit"
+        if response in {"b", "u", "undo"}:
+            return "undo"
+        print("Please respond with y, n, s, q, or b.")
+
+
+def _is_letter(char: str) -> bool:
+    return bool(char) and char.isalpha()
+
+
+def _iter_paragraphs(parent) -> Iterable[Paragraph]:
+    if isinstance(parent, DocxDocument):
+        container = parent.element.body
+    elif isinstance(parent, _Cell):
+        container = parent._tc
+    else:
+        container = parent
+    for child in container.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, parent)
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from _iter_paragraphs(cell)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
