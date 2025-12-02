@@ -9,11 +9,12 @@ import os
 import re
 import sys
 import time
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Deque, Iterable, List, Optional, Sequence, Tuple
 import threading
 
 from anthropic import Anthropic, RateLimitError
@@ -35,6 +36,10 @@ except ImportError:  # pragma: no cover - optional UI enhancement
 
 CLAUDE_MODEL = "claude-sonnet-4-5-20250929"
 MAX_TOKENS = 1200
+TOKEN_GUARD_COMPLETION_MULTIPLIER = 1.2
+TOKEN_GUARD_MARGIN = 50
+COMPLETION_TOKEN_THRESHOLD = MAX_TOKENS - TOKEN_GUARD_MARGIN
+TOKEN_GUARD_DISABLED = False
 PROMPT_PRICE_PER_MILLION = 3.0  # USD
 COMPLETION_PRICE_PER_MILLION = 15.0  # USD
 STYLE_COLUMN_WIDTH = 26
@@ -42,6 +47,7 @@ SPINNER_FRAMES = ["|", "/", "-", "\\"]
 MAX_PARAGRAPHS_PER_CHUNK = 24
 MIN_PARAGRAPHS_PER_OUTPUT = 4
 SENTENCE_BREAK_CHARS = (".", "!", "?")
+MAX_CHUNK_ATTEMPTS = 3
 
 TRANSLATION_STYLES = [
     "Translation",
@@ -253,10 +259,41 @@ def process_document(
 
     chunk_counter = 0
     for style_name, paragraphs in groups:
-        for chunk in _chunk_group(paragraphs, MAX_SOURCE_CHARS, MAX_PARAGRAPHS_PER_CHUNK):
+        pending_chunks: Deque[List[Paragraph]] = deque(
+            _chunk_group(paragraphs, MAX_SOURCE_CHARS, MAX_PARAGRAPHS_PER_CHUNK)
+        )
+        while pending_chunks:
+            chunk = pending_chunks.popleft()
             source_lines = [paragraph.text.strip() for paragraph in chunk]
             if not source_lines:
                 continue
+
+            preview_label = _format_chunk_label(chunk_counter + 1, style_name, len(chunk))
+            exceeds_budget, prompt_estimate, completion_estimate, prepared_prompt = _chunk_exceeds_token_budget(
+                client,
+                source_lines,
+                style_name,
+                translation_memory,
+                source_language,
+                target_language,
+            )
+            if exceeds_budget:
+                split_parts = _split_chunk_for_retry(chunk)
+                if split_parts:
+                    first_half, second_half = split_parts
+                    pending_chunks.appendleft(second_half)
+                    pending_chunks.appendleft(first_half)
+                    print(
+                        f"⚠️ {preview_label} predicted completion {completion_estimate} tokens (prompt {prompt_estimate}). "
+                        f"Splitting into {len(first_half)} + {len(second_half)} paragraphs before translation.",
+                        file=sys.stderr,
+                    )
+                    continue
+                else:
+                    print(
+                        f"⚠️ {preview_label} predicted completion {completion_estimate} tokens but cannot split further; proceeding anyway.",
+                        file=sys.stderr,
+                    )
 
             chunk_counter += 1
             chunk_index = chunk_counter
@@ -266,35 +303,107 @@ def process_document(
                 len(chunk),
             )
 
-            with _chunk_spinner(chunk_label, console):
-                chunk_start = time.time()
-                content, prompt_tokens, completion_tokens = translate_lines(
-                    client,
-                    source_lines,
-                    style_name,
-                    translation_memory,
-                    max_retries,
-                    metrics,
-                    source_language,
-                    target_language,
-                )
+            chunk_success = False
+            final_new_lines: List[str] = []
+            prompt_tokens = completion_tokens = 0
+            chunk_duration = 0.0
 
-            new_lines = _parse_translated_lines(content)
+            for attempt in range(1, MAX_CHUNK_ATTEMPTS + 1):
+                attempt_label = (
+                    chunk_label
+                    if attempt == 1
+                    else f"{chunk_label} (retry {attempt}/{MAX_CHUNK_ATTEMPTS})"
+                )
+                with _chunk_spinner(attempt_label, console):
+                    attempt_start = time.time()
+                    try:
+                        content, prompt_tokens, completion_tokens = translate_lines(
+                            client,
+                            source_lines,
+                            style_name,
+                            translation_memory,
+                            max_retries,
+                            metrics,
+                            source_language,
+                            target_language,
+                            prepared_prompt=prepared_prompt,
+                        )
+                    except Exception as error:
+                        if attempt == MAX_CHUNK_ATTEMPTS:
+                            print(
+                                f"⚠️ Error translating {chunk_label}: {error}. Skipping chunk.",
+                                file=sys.stderr,
+                            )
+                        else:
+                            print(
+                                f"⚠️ Error translating {chunk_label} (attempt {attempt}/{MAX_CHUNK_ATTEMPTS}). "
+                                "Retrying...",
+                                file=sys.stderr,
+                            )
+                        continue
 
-            if len(new_lines) != len(chunk):
-                mismatch_path = _write_mismatch_report(
-                    chunk_label,
-                    source_lines,
-                    new_lines,
-                )
-                print(
-                    "⚠️ Warning: Claude returned a different number of lines than requested; "
-                    f"expected {len(chunk)}, got {len(new_lines)}. Details: {mismatch_path}",
-                    file=sys.stderr,
-                )
+                try:
+                    new_lines = _parse_translated_lines(content)
+                except Exception as error:
+                    if attempt == MAX_CHUNK_ATTEMPTS:
+                        print(
+                            f"⚠️ Unable to parse Claude response for {chunk_label}: {error}",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"⚠️ Parse failure for {chunk_label} (attempt {attempt}/{MAX_CHUNK_ATTEMPTS}); retrying...",
+                            file=sys.stderr,
+                        )
+                    continue
+
+                if _contains_json_artifacts(new_lines):
+                    message = (
+                        f"⚠️ Claude returned JSON delimiters for {chunk_label}; "
+                        "response looked like raw [ ... ]."
+                    )
+                    if attempt == MAX_CHUNK_ATTEMPTS:
+                        print(message, file=sys.stderr)
+                    else:
+                        print(message + " Retrying...", file=sys.stderr)
+                        continue
+
+                if len(new_lines) != len(chunk):
+                    if attempt == MAX_CHUNK_ATTEMPTS:
+                        mismatch_path = _write_mismatch_report(
+                            chunk_label,
+                            source_lines,
+                            new_lines,
+                        )
+                        print(
+                            "⚠️ Warning: Claude returned a different number of lines than requested; "
+                            f"expected {len(chunk)}, got {len(new_lines)}. Details: {mismatch_path}",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"⚠️ Line-count mismatch for {chunk_label} (attempt {attempt}/{MAX_CHUNK_ATTEMPTS}); retrying...",
+                            file=sys.stderr,
+                        )
+                        continue
+
+                final_new_lines = new_lines
+                chunk_duration = time.time() - attempt_start
+                chunk_success = True
+                break
+
+            if not chunk_success:
+                split_parts = _split_chunk_for_retry(chunk)
+                if split_parts:
+                    first_half, second_half = split_parts
+                    pending_chunks.appendleft(second_half)
+                    pending_chunks.appendleft(first_half)
+                    print(
+                        f"⚠️ {chunk_label} exhausted {MAX_CHUNK_ATTEMPTS} attempts; splitting into {len(first_half)} + {len(second_half)} paragraphs for another try.",
+                        file=sys.stderr,
+                    )
                 continue
 
-            chunk_duration = time.time() - chunk_start
             chunk_cost = _calculate_cost(prompt_tokens, completion_tokens)
             chunk_message = _format_chunk_message(
                 chunk_label,
@@ -308,7 +417,7 @@ def process_document(
             )
             _emit_live_message(chunk_message, console)
 
-            for paragraph, new_text in zip(chunk, new_lines):
+            for paragraph, new_text in zip(chunk, final_new_lines):
                 paragraph.text = new_text
                 translated += 1
 
@@ -326,8 +435,10 @@ def translate_lines(
     metrics: Metrics,
     source_language: str,
     target_language: str,
+    *,
+    prepared_prompt: Optional[str] = None,
 ) -> Tuple[str, int, int]:
-    user_prompt = build_prompt(
+    user_prompt = prepared_prompt or build_prompt(
         lines,
         style_name,
         translation_memory,
@@ -633,6 +744,15 @@ def _parse_translated_lines(content: str) -> List[str]:
     )
 
 
+def _contains_json_artifacts(lines: Sequence[str]) -> bool:
+    combined = "".join(lines).strip()
+    if not combined:
+        return True
+    has_brackets = combined.startswith("[") and combined.endswith("]")
+    has_quotes_block = combined.count("\n") > 0 and combined.count("[") > 0
+    return has_brackets or has_quotes_block
+
+
 def _recover_translation_array(content: str) -> Optional[List[str]]:
     match = re.search(r"\[(.*)\]", content, re.DOTALL)
     snippet = match.group(0) if match else content
@@ -780,6 +900,34 @@ def _chunk_group(
         yield chunk
 
 
+def _chunk_exceeds_token_budget(
+    client: Anthropic,
+    source_lines: Sequence[str],
+    style_name: str,
+    translation_memory: Sequence[Tuple[str, str]],
+    source_language: str,
+    target_language: str,
+) -> Tuple[bool, int, int, str]:
+    prepared_prompt = build_prompt(
+        source_lines,
+        style_name,
+        translation_memory,
+        source_language,
+        target_language,
+    )
+
+    if TOKEN_GUARD_DISABLED:
+        return False, 0, 0, prepared_prompt
+
+    prompt_estimate = _count_tokens(
+        client,
+        messages=[{"role": "user", "content": prepared_prompt}],
+    )
+    completion_estimate = _estimate_completion_tokens(client, source_lines)
+    exceeds = completion_estimate >= COMPLETION_TOKEN_THRESHOLD
+    return exceeds, prompt_estimate, completion_estimate, prepared_prompt
+
+
 def _select_split_index(chunk_len: int, break_indices: List[int]) -> int:
     for idx in reversed(break_indices):
         if MIN_PARAGRAPHS_PER_OUTPUT <= idx < chunk_len - MIN_PARAGRAPHS_PER_OUTPUT:
@@ -791,11 +939,64 @@ def _select_split_index(chunk_len: int, break_indices: List[int]) -> int:
     return fallback
 
 
+def _split_chunk_for_retry(chunk: Sequence[Paragraph]) -> Optional[Tuple[List[Paragraph], List[Paragraph]]]:
+    if len(chunk) < MIN_PARAGRAPHS_PER_OUTPUT * 2:
+        return None
+
+    break_indices: List[int] = []
+    for idx, paragraph in enumerate(chunk, start=1):
+        if _paragraph_ends_sentence(paragraph.text or ""):
+            break_indices.append(idx)
+
+    split_index = _select_split_index(len(chunk), break_indices)
+    if split_index <= 0 or split_index >= len(chunk):
+        return None
+
+    first_half = list(chunk[:split_index])
+    second_half = list(chunk[split_index:])
+    if len(first_half) < MIN_PARAGRAPHS_PER_OUTPUT or len(second_half) < MIN_PARAGRAPHS_PER_OUTPUT:
+        return None
+    return first_half, second_half
+
+
 def _paragraph_ends_sentence(text: str) -> bool:
     stripped = (text or "").rstrip()
     if not stripped:
         return True
     return stripped.endswith(SENTENCE_BREAK_CHARS)
+
+
+def _estimate_completion_tokens(client: Anthropic, lines: Sequence[str]) -> int:
+    translation_guess = json.dumps(list(lines), ensure_ascii=False)
+    token_estimate = _count_tokens(
+        client,
+        messages=[{"role": "assistant", "content": translation_guess}],
+    )
+    if not token_estimate:
+        token_estimate = _fallback_token_estimate(translation_guess)
+    scaled = int(token_estimate * TOKEN_GUARD_COMPLETION_MULTIPLIER)
+    return scaled
+
+
+def _count_tokens(client: Anthropic, *, messages: Sequence[dict]) -> int:
+    try:
+        response = client.messages.count_tokens(
+            model=CLAUDE_MODEL,
+            messages=messages,
+        )
+    except Exception as error:  # pragma: no cover - defensive logging
+        print(
+            f"⚠️ Unable to call Anthropic count_tokens: {error}. Falling back to heuristic estimate.",
+            file=sys.stderr,
+        )
+        return 0
+    return int(getattr(response, "input_tokens", 0) or 0)
+
+
+def _fallback_token_estimate(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, len(text) // 4)
 
 
 if __name__ == "__main__":
