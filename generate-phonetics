@@ -31,7 +31,9 @@ PERL_LIB_PATH = LINGUA_DIR / "lib"
 PERL_SCRIPT_PATH = LINGUA_DIR / "bin" / "pronounce.pl"
 DEFAULT_TIBETAN_STYLE = "Verse Tibetan"
 DEFAULT_PHONETICS_STYLE = "Verse Phonetics"
-DEFAULT_MANTRA_STYLE = "Mantra  Tibetan"
+DEFAULT_INSERTED_TIBETAN_STYLE = "Inserted Verse Tibetan"
+DEFAULT_INSERTED_PHONETICS_STYLE = "Inserted Verse Phonetics"
+DEFAULT_MANTRA_STYLE = "Mantra Tibetan"
 DEFAULT_SKIP_CHAR_STYLE = "Yigchung Tibetan Characters"
 DEFAULT_MANTRA_CHAR_STYLE = "Sanskrit at the beginning"
 GYUR_SUFFIX = " gyur"
@@ -180,24 +182,29 @@ def ensure_phonetics_style(document: Document, style_name: str) -> None:
 
 def process_docx(
     path: Path,
-    tibetan_style: str,
-    phonetics_style: str,
+    style_pairs: Sequence[tuple[str, str]],
     mantra_style: str | None,
     skip_char_style: str | None,
     mantra_char_style: str | None,
 ) -> int:
     document = Document(path)
-    ensure_phonetics_style(document, phonetics_style)
+    seen_phonetics_styles = {
+        phonetics_style for _, phonetics_style in style_pairs if phonetics_style
+    }
+    for style_name in seen_phonetics_styles:
+        ensure_phonetics_style(document, style_name)
     _ensure_mantra_char_style(document, mantra_char_style)
     inserted_count = 0
     index = 0
+    tibetan_to_phonetics = {t: p for t, p in style_pairs if t and p}
     while True:
         paragraphs = document.paragraphs
         if index >= len(paragraphs):
             break
         paragraph = paragraphs[index]
         paragraph_style = paragraph.style.name if paragraph.style is not None else ""
-        if paragraph_style == tibetan_style:
+        phonetics_style = tibetan_to_phonetics.get(paragraph_style)
+        if phonetics_style:
             next_paragraph = paragraphs[index + 1] if index + 1 < len(paragraphs) else None
             next_style = next_paragraph.style.name if next_paragraph and next_paragraph.style else ""
             if mantra_style and next_style == mantra_style:
@@ -245,6 +252,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("paths", nargs="+", help="Files or folders to scan for .docx documents")
     parser.add_argument("--tibetan-style", default=DEFAULT_TIBETAN_STYLE, dest="tibetan_style")
     parser.add_argument("--phonetics-style", default=DEFAULT_PHONETICS_STYLE, dest="phonetics_style")
+    parser.add_argument(
+        "--inserted-tibetan-style",
+        default=DEFAULT_INSERTED_TIBETAN_STYLE,
+        dest="inserted_tibetan_style",
+        help=(
+            "Additional Tibetan style to process (default: %(default)s). "
+            "Pass an empty string to disable."
+        ),
+    )
+    parser.add_argument(
+        "--inserted-phonetics-style",
+        default=DEFAULT_INSERTED_PHONETICS_STYLE,
+        dest="inserted_phonetics_style",
+        help=(
+            "Phonetics style to use for the inserted Tibetan style (default: %(default)s). "
+            "Ignored if --inserted-tibetan-style is empty."
+        ),
+    )
     parser.add_argument("--mantra-style", default=DEFAULT_MANTRA_STYLE, dest="mantra_style")
     parser.add_argument(
         "--skip-char-style",
@@ -277,6 +302,11 @@ def main() -> None:
     mantra_style = None if args.no_mantra else args.mantra_style
     skip_char_style = args.skip_char_style.strip() or None
     mantra_char_style = args.mantra_char_style.strip() or None
+    style_pairs: List[tuple[str, str]] = [(args.tibetan_style, args.phonetics_style)]
+    inserted_tibetan_style = args.inserted_tibetan_style.strip()
+    inserted_phonetics_style = args.inserted_phonetics_style.strip()
+    if inserted_tibetan_style and inserted_phonetics_style:
+        style_pairs.append((inserted_tibetan_style, inserted_phonetics_style))
     ensure_perl_prerequisites()
     docx_files = collect_docx_files(args.paths)
     if not docx_files:
@@ -287,8 +317,7 @@ def main() -> None:
         try:
             inserted = process_docx(
                 docx_path,
-                args.tibetan_style,
-                args.phonetics_style,
+                style_pairs,
                 mantra_style,
                 skip_char_style,
                 mantra_char_style,
