@@ -11,6 +11,7 @@ from typing import List
 
 SCRIPT_NAMES = [
     "fix-tibetan-spaces",
+    "fix-hard-tshegs-after-nga",
     "fix-tibetan-broken-stackings",
     "fix-tibetan-word-styles",
     "fix-character-styles",

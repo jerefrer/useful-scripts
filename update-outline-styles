@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Update DOCX headings to nested outline styles based on numbering tokens."""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+from typing import Iterable, List, Sequence
+
+try:
+    from docx import Document
+    from docx.document import Document as DocxDocument
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import _Cell, Table
+    from docx.text.paragraph import Paragraph
+except ImportError:  # pragma: no cover - CLI ergonomics only
+    print("Error: python-docx library not found.", file=sys.stderr)
+    print("Install it with: pip install python-docx", file=sys.stderr)
+    sys.exit(1)
+
+SOURCE_STYLES = ("Heading 2 Translation", "Heading 3 Translation")
+TOKEN_TO_STYLE = {
+    "I.": "Heading 3 Translation in TOC",
+    "1.": "Heading 4 Translation in TOC",
+    "A.": "Heading 5 Translation in TOC",
+    "i.": "Heading 6 Translation in TOC",
+    "i)": "Heading 6 Translation in TOC",
+    "1)": "Heading 7 Translation in TOC",
+}
+TARGET_STYLES = set(TOKEN_TO_STYLE.values())
+FALLBACK_FONT_NAME = "Times New Roman"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "For each DOCX file provided (or found inside folders), locate paragraphs with"
+            " styles 'Heading 2 Translation' or 'Heading 3 Translation' and remap them to"
+            " nested outline styles (Heading 3-7 Translation in TOC) according to the"
+            " numbering token at the start of the text."
+        )
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="DOCX files or folders to process",
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Process DOCX files inside folders recursively",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    docx_paths = _collect_docx_paths(args.paths, args.recursive)
+    if not docx_paths:
+        print("Warning: no DOCX files found.", file=sys.stderr)
+        return 1
+
+    processed = 0
+    modified = 0
+    for path in docx_paths:
+        processed += 1
+        document = Document(path)
+        styles_created = _ensure_target_styles(document)
+        changes = _update_outline_styles(document)
+        if changes or styles_created:
+            document.save(path)
+            modified += 1
+            if changes:
+                print(f"Updated {path} ({changes} paragraph(s) remapped)")
+            else:
+                print(f"Created missing TOC styles in {path}")
+
+    print(f"Processed {processed} file(s); updated {modified} file(s).")
+    return 0 if modified else 1
+
+
+def _collect_docx_paths(inputs: Sequence[str], recursive: bool) -> List[Path]:
+    paths: List[Path] = []
+    for path_str in inputs:
+        path = Path(path_str).expanduser()
+        if not path.exists():
+            print(f"Warning: path not found, skipping: {path}", file=sys.stderr)
+            continue
+        if path.is_file() and _is_valid_docx(path):
+            paths.append(path)
+        elif path.is_dir():
+            iterator: Iterable[Path] = path.rglob("*.docx") if recursive else path.glob("*.docx")
+            for candidate in iterator:
+                if _is_valid_docx(candidate):
+                    paths.append(candidate)
+        else:
+            print(f"Warning: unsupported path type, skipping: {path}", file=sys.stderr)
+    return sorted(paths)
+
+
+def _is_valid_docx(path: Path) -> bool:
+    return path.suffix.lower() == ".docx" and not path.name.startswith("~$")
+
+
+def _ensure_target_styles(document: Document) -> bool:
+    created_any = False
+    base_style = _get_style(document, "Heading 2 Translation") or _get_style(
+        document, "Heading 3 Translation"
+    )
+    for style_name in TARGET_STYLES:
+        if _get_style(document, style_name):
+            continue
+        new_style = document.styles.add_style(style_name, WD_STYLE_TYPE.PARAGRAPH)
+        if base_style:
+            _copy_style_format(base_style, new_style)
+        else:
+            font = new_style.font
+            font.name = FALLBACK_FONT_NAME
+            font.bold = True
+            font.italic = True
+        created_any = True
+    return created_any
+
+
+def _copy_style_format(source_style, target_style) -> None:
+    target_style.base_style = source_style.base_style
+    font = target_style.font
+    source_font = source_style.font
+    font.name = source_font.name
+    font.size = source_font.size
+    font.bold = source_font.bold
+    font.italic = source_font.italic
+    font.color.rgb = source_font.color.rgb
+
+
+def _update_outline_styles(document: Document) -> int:
+    changes = 0
+    for paragraph in _iter_paragraphs(document):
+        style_name = paragraph.style.name if paragraph.style else ""
+        if style_name not in SOURCE_STYLES:
+            continue
+        text = paragraph.text or ""
+        trimmed = text.lstrip()
+        token = _extract_leading_token(trimmed)
+        if not token:
+            continue
+        target_style_name = TOKEN_TO_STYLE.get(token)
+        if not target_style_name:
+            continue
+        if token == "i)":
+            paragraph.text = text.replace("i)", "i.", 1)
+        paragraph.style = document.styles[target_style_name]
+        changes += 1
+    return changes
+
+
+def _extract_leading_token(text: str) -> str | None:
+    for token in TOKEN_TO_STYLE:
+        if text.startswith(token):
+            return token
+    return None
+
+
+def _get_style(document: Document, name: str):
+    try:
+        return document.styles[name]
+    except KeyError:
+        return None
+
+
+def _iter_paragraphs(parent) -> Iterable[Paragraph]:
+    if isinstance(parent, DocxDocument):
+        container = parent.element.body
+    elif isinstance(parent, _Cell):
+        container = parent._tc
+    else:
+        container = parent
+    for child in container.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, parent)
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from _iter_paragraphs(cell)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

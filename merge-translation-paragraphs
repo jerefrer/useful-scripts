@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""Merge translation paragraphs from paired DOCX folders."""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+from typing import Iterable, List
+
+try:
+    from docx import Document
+    from docx.document import Document as DocxDocument
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import _Cell, Table
+    from docx.text.paragraph import Paragraph
+except ImportError:  # pragma: no cover - CLI ergonomics
+    print("Error: python-docx library not found.", file=sys.stderr)
+    print("Install it with: pip install python-docx", file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Copy translation paragraphs (style names containing 'Translation') from DOCX"
+            " originals into their translations. Works on folders (batch) or a single DOCX"
+            " pair. Writes merged copies to an output folder/file or overwrites translations"
+            " when no output is provided."
+        )
+    )
+    parser.add_argument("original_folder", help="Folder containing the base/original DOCX files")
+    parser.add_argument(
+        "translation_folder",
+        help="Folder containing the DOCX files that include updated translation paragraphs",
+    )
+    parser.add_argument(
+        "output_folder",
+        nargs="?",
+        help=(
+            "Destination folder for merged DOCX files. If omitted, translation files will be"
+            " overwritten in place."
+        ),
+    )
+    parser.add_argument(
+        "--style-substring",
+        default="Translation",
+        help=(
+            "Case-insensitive substring that must appear in a paragraph's style name to be"
+            " considered a translation paragraph (default: %(default)s)."
+        ),
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Process DOCX files recursively, preserving the folder structure under the output",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would change without writing any files",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    original_input = Path(args.original_folder).expanduser()
+    translation_input = Path(args.translation_folder).expanduser()
+    output_arg = Path(args.output_folder).expanduser() if args.output_folder else None
+    dry_run = args.dry_run
+
+    if not original_input.exists():
+        print(f"Error: original path not found: {original_input}", file=sys.stderr)
+        return 2
+    if not translation_input.exists():
+        print(f"Error: translation path not found: {translation_input}", file=sys.stderr)
+        return 2
+
+    directory_mode = original_input.is_dir()
+    if directory_mode and not translation_input.is_dir():
+        print("Error: when original path is a folder, translation path must also be a folder.", file=sys.stderr)
+        return 2
+    if original_input.is_file() and not translation_input.is_file():
+        print("Error: when original path is a file, translation path must also be a file.", file=sys.stderr)
+        return 2
+    if not directory_mode and not original_input.is_file():
+        print(f"Error: original path is neither a folder nor a file: {original_input}", file=sys.stderr)
+        return 2
+
+    if directory_mode:
+        original_dir = original_input
+        translation_dir = translation_input
+        docx_iter = original_dir.rglob("*.docx") if args.recursive else original_dir.glob("*.docx")
+        output_root: Path | None = None
+        output_file_override: Path | None = None
+        if output_arg:
+            if output_arg.exists() and not output_arg.is_dir():
+                print("Error: output path must be a folder when processing directories.", file=sys.stderr)
+                return 2
+            output_root = output_arg
+    else:
+        original_file = original_input
+        translation_file = translation_input
+        docx_iter = [original_file]
+        output_root = None
+        output_file_override = None
+        if output_arg:
+            if output_arg.exists() and output_arg.is_dir():
+                output_root = output_arg
+            elif output_arg.suffix.lower() == ".docx" or output_arg.suffix:
+                output_file_override = output_arg
+            else:
+                output_root = output_arg
+
+    processed = 0
+    copied_paragraphs = 0
+    skipped_missing = 0
+    skipped_mismatched = 0
+
+    for original_path in sorted(docx_iter):
+        if _is_word_temp_file(original_path):
+            continue
+        if directory_mode:
+            relative_path = original_path.relative_to(original_dir)
+            translation_path = translation_dir / relative_path
+            if _is_word_temp_file(translation_path):
+                continue
+        else:
+            relative_path = None
+            translation_path = translation_file
+        if not translation_path.is_file():
+            print(
+                f"⚠️ Skipping {original_path}: translation file not found at {translation_path}",
+                file=sys.stderr,
+            )
+            skipped_missing += 1
+            if not directory_mode:
+                break
+            continue
+
+        try:
+            original_doc = Document(original_path)
+            translation_doc = Document(translation_path)
+        except Exception as exc:  # pragma: no cover - corrupt file handling
+            print(f"⚠️ Could not open pair {original_path} / {translation_path}: {exc}", file=sys.stderr)
+            continue
+
+        original_paragraphs = _collect_translation_paragraphs(
+            original_doc,
+            args.style_substring,
+        )
+        translation_paragraphs = _collect_translation_paragraphs(
+            translation_doc,
+            args.style_substring,
+        )
+
+        if len(original_paragraphs) != len(translation_paragraphs):
+            _log_mismatch_details(
+                original_path,
+                translation_path,
+                original_paragraphs,
+                translation_paragraphs,
+            )
+            print(
+                "⚠️ Paragraph count mismatch for"
+                f" {original_path.name}: original has {len(original_paragraphs)},"
+                f" translation has {len(translation_paragraphs)}. Skipping.",
+                file=sys.stderr,
+            )
+            skipped_mismatched += 1
+            continue
+
+        replacements = len(original_paragraphs)
+        destination_path = _resolve_destination_path(
+            original_path,
+            translation_path,
+            relative_path=relative_path,
+            output_root=output_root,
+            output_file_override=output_file_override,
+        )
+
+        if dry_run:
+            copied_paragraphs += replacements
+            processed += 1
+            print(
+                f"[dry-run] Would merge {original_path.name}"
+                f" -> {destination_path} ({replacements} paragraph(s))"
+            )
+            continue
+
+        for target, source in zip(original_paragraphs, translation_paragraphs):
+            _copy_paragraph_contents(target, source)
+        copied_paragraphs += replacements
+
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        original_doc.save(destination_path)
+        processed += 1
+        print(f"Merged {original_path.name} -> {destination_path}")
+
+    summary_prefix = "Dry run" if dry_run else "Done"
+    print(
+        f"{summary_prefix}: processed {processed} file(s), copied {copied_paragraphs} paragraph(s). "
+        f"Missing translations: {skipped_missing}, mismatches: {skipped_mismatched}."
+    )
+    return 0 if processed else 1
+
+
+def _collect_translation_paragraphs(document: Document, keyword: str) -> List[Paragraph]:
+    matches: List[Paragraph] = []
+    keyword_lower = keyword.lower()
+    for paragraph in _iter_paragraphs(document):
+        style_name = paragraph.style.name if paragraph.style else ""
+        if keyword_lower in style_name.lower():
+            matches.append(paragraph)
+    return matches
+
+
+def _iter_paragraphs(parent) -> Iterable[Paragraph]:
+    if isinstance(parent, DocxDocument):
+        container = parent.element.body
+    elif isinstance(parent, _Cell):
+        container = parent._tc
+    else:
+        container = parent
+    for child in container.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, parent)
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from _iter_paragraphs(cell)
+
+
+def _copy_paragraph_contents(target: Paragraph, source: Paragraph) -> None:
+    while target.runs:
+        target._element.remove(target.runs[0]._r)
+    if target.paragraph_format is not None and source.paragraph_format is not None:
+        target.paragraph_format.left_indent = source.paragraph_format.left_indent
+        target.paragraph_format.right_indent = source.paragraph_format.right_indent
+        target.paragraph_format.first_line_indent = source.paragraph_format.first_line_indent
+        target.paragraph_format.space_before = source.paragraph_format.space_before
+        target.paragraph_format.space_after = source.paragraph_format.space_after
+        target.paragraph_format.line_spacing_rule = source.paragraph_format.line_spacing_rule
+        target.paragraph_format.line_spacing = source.paragraph_format.line_spacing
+    for run in source.runs:
+        new_run = target.add_run(run.text)
+        _copy_run_formatting(new_run, run)
+
+
+def _copy_run_formatting(target_run, source_run) -> None:
+    target_run.bold = source_run.bold
+    target_run.italic = source_run.italic
+    target_run.underline = source_run.underline
+    target_run.font.name = source_run.font.name
+    target_run.font.size = source_run.font.size
+    target_run.font.color.rgb = source_run.font.color.rgb if source_run.font.color else None
+
+
+def _is_word_temp_file(path: Path) -> bool:
+    return path.name.startswith("~$")
+
+
+def _resolve_destination_path(
+    original_path: Path,
+    translation_path: Path,
+    *,
+    relative_path: Path | None,
+    output_root: Path | None,
+    output_file_override: Path | None,
+) -> Path:
+    if output_file_override:
+        return output_file_override
+    if output_root:
+        if relative_path is not None:
+            return output_root / relative_path
+        return output_root / original_path.name
+    return translation_path
+
+
+def _log_mismatch_details(
+    original_path: Path,
+    translation_path: Path,
+    originals: List[Paragraph],
+    translations: List[Paragraph],
+) -> None:
+    diff_index, original_para, translation_para = _find_first_difference(originals, translations)
+    position = diff_index + 1
+    print(
+        f"⚠️ Mismatch around paragraph #{position} for {original_path.name} "
+        f"(translation file {translation_path.name}).",
+        file=sys.stderr,
+    )
+    if original_para is not None:
+        print(
+            "    Original : " + _format_paragraph_hint(original_para, position),
+            file=sys.stderr,
+        )
+    else:
+        print("    Original : <no paragraph at this position>", file=sys.stderr)
+    if translation_para is not None:
+        print(
+            "    Translation: " + _format_paragraph_hint(translation_para, position),
+            file=sys.stderr,
+        )
+    else:
+        print("    Translation: <no paragraph at this position>", file=sys.stderr)
+
+
+def _find_first_difference(
+    originals: List[Paragraph],
+    translations: List[Paragraph],
+) -> tuple[int, Paragraph | None, Paragraph | None]:
+    limit = min(len(originals), len(translations))
+    for idx in range(limit):
+        original_para = originals[idx]
+        translation_para = translations[idx]
+        if _paragraph_signature(original_para) != _paragraph_signature(translation_para):
+            return idx, original_para, translation_para
+    if len(originals) > len(translations):
+        return limit, originals[limit], None
+    if len(translations) > len(originals):
+        return limit, None, translations[limit]
+    return limit, None, None
+
+
+def _paragraph_signature(paragraph: Paragraph) -> str:
+    return paragraph.style.name if paragraph.style else ""
+
+
+def _format_paragraph_hint(paragraph: Paragraph, position: int, *, max_chars: int = 120) -> str:
+    style_name = paragraph.style.name if paragraph.style else "(no style)"
+    text = (paragraph.text or "").strip().replace("\n", " ")
+    if len(text) > max_chars:
+        text = text[: max_chars - 1].rstrip() + "…"
+    return f"#{position} [{style_name}] {text or '<empty>'}"
+
+
+if __name__ == "__main__":
+    sys.exit(main())

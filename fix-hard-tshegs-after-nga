@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Fix broken Tibetan stackings inside Tibetan-styled paragraphs."""
+"""Replace soft tshegs after ང with the hard tsheg (༌) before punctuation in DOCX files."""
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 from typing import List, Sequence, Tuple
@@ -17,38 +18,25 @@ except ImportError:  # pragma: no cover - CLI ergonomics only
 
 DOCX_SUFFIX = ".docx"
 TEMP_PREFIX = "~$"
-REPLACEMENTS: Tuple[Tuple[str, str], ...] = (
-    ("བིགྷྣཱན", "བིན"),
-    ("བྷྱོ", "ོ"),
-    ("བྷྱ", ""),
-    ("གྷྲྀཧྞ", ""),
-    ("གྷྲཱིཧྣ", "ཱི"),
-    ("གྷྲིཧྣ", "ི"),
-    ("བྷྲཱུ", ""),
-    ("བྷྲཱུ", ""),
-    ("ཏིཀྵྞ", "ཏི"),
-    ("བིགྷྣཱྃ", "བི"),
-    ("བིགྷྣན", "བིན"),
-    ("དྷྱ", ""),
-    ("དྷ", "དྷ"),
-)
+PATTERN = re.compile(r"ང[ེིོུ]?[ཾྃྂ]?་([།༔])")
+REPLACEMENT = r"ང༌\1"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Replace specific broken Tibetan stacking sequences with corrected glyphs "
-            "inside any paragraph whose style name contains 'Tibetan'."
+            "Scan DOCX files and replace occurrences of ང་ before punctuation with the hard tsheg ༌."
         )
     )
     parser.add_argument(
         "paths",
         nargs="+",
-        help="DOCX files or folders to scan (folders processed recursively).",
+        help="DOCX files or folders to process (folders scanned recursively).",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Show what would change without modifying any files.",
+        help="Report what would change without modifying any files.",
     )
     return parser.parse_args()
 
@@ -93,9 +81,7 @@ def process_file(doc_path: Path, dry_run: bool) -> Tuple[int, int]:
     replacements = 0
 
     for paragraph in document.paragraphs:
-        if not _has_tibetan_style(paragraph):
-            continue
-        changed, count = _replace_sequences(paragraph)
+        changed, count = _fix_paragraph(paragraph)
         if changed:
             modified_paragraphs += 1
             replacements += count
@@ -106,13 +92,7 @@ def process_file(doc_path: Path, dry_run: bool) -> Tuple[int, int]:
     return modified_paragraphs, replacements
 
 
-def _has_tibetan_style(paragraph) -> bool:
-    style = getattr(paragraph, "style", None)
-    name = getattr(style, "name", "") or ""
-    return "tibetan" in name.lower()
-
-
-def _replace_sequences(paragraph) -> Tuple[bool, int]:
+def _fix_paragraph(paragraph) -> Tuple[bool, int]:
     changed = False
     replacements = 0
 
@@ -120,17 +100,10 @@ def _replace_sequences(paragraph) -> Tuple[bool, int]:
         text = run.text
         if not text:
             continue
-        new_text = text
-        run_replacements = 0
-        for old, new in REPLACEMENTS:
-            occurrences = new_text.count(old)
-            if not occurrences:
-                continue
-            new_text = new_text.replace(old, new)
-            run_replacements += occurrences
-        if run_replacements:
+        new_text, count = PATTERN.subn(REPLACEMENT, text)
+        if count:
             run.text = new_text
-            replacements += run_replacements
+            replacements += count
             changed = True
 
     return changed, replacements
@@ -150,7 +123,7 @@ def main() -> int:
 
     for doc_path in docx_paths:
         try:
-            modified, count = process_file(doc_path, args.dry_run)
+            modified, replacements = process_file(doc_path, args.dry_run)
         except Exception as exc:  # pragma: no cover - runtime safety
             had_errors = True
             print(f"Error processing {doc_path}: {exc}", file=sys.stderr)
@@ -159,17 +132,17 @@ def main() -> int:
         if modified:
             touched_files += 1
             total_paragraphs += modified
-            total_replacements += count
+            total_replacements += replacements
             status = "[DRY-RUN] " if args.dry_run else ""
             print(
-                f"{status}{doc_path}: applied {count} replacement(s) across "
-                f"{modified} Tibetan paragraph(s)"
+                f"{status}{doc_path}: converted {replacements} occurrence(s) across "
+                f"{modified} paragraph(s)"
             )
         else:
-            print(f"{doc_path}: no Tibetan paragraphs needed changes")
+            print(f"{doc_path}: no replacements needed")
 
     print(
-        f"Updated {total_paragraphs} paragraph(s) with {total_replacements} substitution(s) "
+        f"Updated {total_paragraphs} paragraph(s) and {total_replacements} occurrence(s) "
         f"across {touched_files} file(s){' (dry-run)' if args.dry_run else ''}."
     )
 

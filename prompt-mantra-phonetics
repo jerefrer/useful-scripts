@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""Interactively insert Mantra Phonetics paragraphs after orphaned Mantra Tibetan paragraphs."""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import os
+import sys
+import tempfile
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+from typing import Iterable, List, Optional, Tuple
+
+try:
+    from docx import Document
+    from docx.document import Document as DocxDocument
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import Table, _Cell
+    from docx.text.paragraph import Paragraph
+except ImportError as error:  # pragma: no cover - runtime guard
+    sys.stderr.write(
+        "python-docx is required. Install it with `pip install python-docx` before running this script.\n"
+    )
+    raise
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+GENERATE_PHONETICS_PATH = SCRIPT_DIR / "generate-phonetics"
+DEFAULT_MANTRA_STYLE = "Mantra Tibetan"
+DEFAULT_PHONETICS_STYLE = "Mantra Phonetics"
+DEFAULT_CONTEXT_LINES = 3
+DEFAULT_SKIP_CHAR_STYLE = "Yigchung Tibetan Characters"
+DEFAULT_MANTRA_CHAR_STYLE = "Sanskrit at the beginning"
+COLOR_ENABLED = sys.stdout.isatty()
+
+
+class _Color:
+    CYAN = "\033[96m"
+    RESET = "\033[0m"
+
+
+_GP_MODULE = None
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Scan DOCX files for Mantra Tibetan paragraphs that are not immediately followed by "
+            "Mantra Phonetics paragraphs and interactively insert transliterated phonetics."
+        )
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="DOCX files or folders to scan (folders are processed recursively)",
+    )
+    parser.add_argument(
+        "--mantra-style",
+        default=DEFAULT_MANTRA_STYLE,
+        dest="mantra_style",
+        help="Name of the Tibetan mantra paragraph style to scan (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--phonetics-style",
+        default=DEFAULT_PHONETICS_STYLE,
+        dest="phonetics_style",
+        help="Name of the phonetics paragraph style to insert (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--skip-char-style",
+        default=DEFAULT_SKIP_CHAR_STYLE,
+        dest="skip_char_style",
+        help=(
+            "Character style whose runs should be ignored when generating phonetics "
+            "(default: %(default)s). Pass an empty string to disable."
+        ),
+    )
+    parser.add_argument(
+        "--mantra-char-style",
+        default=DEFAULT_MANTRA_CHAR_STYLE,
+        dest="mantra_char_style",
+        help=(
+            "Character style applied to transliterated mantra prefixes (default: %(default)s). "
+            "Pass an empty string to disable styling."
+        ),
+    )
+    parser.add_argument(
+        "--context-lines",
+        type=int,
+        default=DEFAULT_CONTEXT_LINES,
+        dest="context_lines",
+        help="Number of surrounding paragraphs to display for context (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI color output even when stdout is a TTY.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if args.context_lines < 0:
+        raise SystemExit("--context-lines must be a non-negative integer")
+
+    global COLOR_ENABLED
+    if args.no_color:
+        COLOR_ENABLED = False
+
+    args.skip_char_style = args.skip_char_style.strip() or None
+    args.mantra_char_style = args.mantra_char_style.strip() or None
+
+    gp_module = _get_generate_phonetics_module()
+    gp_module.ensure_perl_prerequisites()
+
+    docx_files = collect_docx_files(args.paths)
+    if not docx_files:
+        sys.stderr.write("No DOCX files found.\n")
+        return
+
+    total_inserted = 0
+    for path in docx_files:
+        try:
+            inserted, quit_requested = process_document(path, args, gp_module)
+        except Exception as error:  # pragma: no cover - defensive
+            sys.stderr.write(
+                f"Error processing {_relative_path(path)}: {error}\n"
+            )
+            continue
+        total_inserted += inserted
+        status = "no changes" if inserted == 0 else f"inserted {inserted} phonetics paragraph(s)"
+        print(f"{_relative_path(path)}: {status}")
+        if quit_requested:
+            break
+
+    print(f"Done. Total phonetics paragraphs inserted: {total_inserted}")
+
+
+def collect_docx_files(paths: Iterable[str]) -> List[Path]:
+    docx_files: List[Path] = []
+    for raw_path in paths:
+        path = Path(raw_path).expanduser().resolve()
+        if path.is_file():
+            if _is_valid_docx(path):
+                docx_files.append(path)
+            else:
+                sys.stderr.write(
+                    f"Skipped {_relative_path(path)}: not a valid .docx file.\n"
+                )
+        elif path.is_dir():
+            for file_path in sorted(path.rglob("*.docx")):
+                if _is_valid_docx(file_path):
+                    docx_files.append(file_path.resolve())
+        else:
+            sys.stderr.write(
+                f"Skipped {_relative_path(path)}: not a .docx file or directory.\n"
+            )
+    return docx_files
+
+
+def _is_valid_docx(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() == ".docx" and not path.name.startswith("~$")
+
+
+def process_document(
+    path: Path,
+    args: argparse.Namespace,
+    module,
+) -> tuple[int, bool]:
+    document = Document(path)
+    _ensure_style_exists(document, args.phonetics_style)
+    module._ensure_mantra_char_style(document, args.mantra_char_style)
+    paragraphs = list(_iter_paragraphs(document))
+    inserted = 0
+    index = 0
+    quit_requested = False
+
+    while index < len(paragraphs):
+        paragraph = paragraphs[index]
+        if _style_name(paragraph.style) != args.mantra_style:
+            index += 1
+            continue
+
+        existing_offset = _find_existing_phonetics(paragraphs, index, args.phonetics_style)
+        if existing_offset is not None:
+            index += existing_offset + 1
+            continue
+
+        _display_context(paragraphs, index, args.context_lines, path)
+        action = _prompt_user()
+        if action == "yes":
+            segments = _build_mantra_segments(
+                module,
+                paragraph,
+                args.skip_char_style,
+                args.mantra_char_style,
+            )
+            if not segments:
+                print("No phonetics were generated. Skipping.")
+                index += 1
+                continue
+            module.insert_phonetics_paragraph(
+                paragraph,
+                segments,
+                args.phonetics_style,
+            )
+            inserted += 1
+            paragraphs = list(_iter_paragraphs(document))
+            index += 2
+        elif action == "no":
+            index += 1
+        elif action == "skip_file":
+            break
+        elif action == "quit":
+            quit_requested = True
+            break
+
+    if inserted:
+        _safe_save_document(document, path)
+    return inserted, quit_requested
+
+
+def _display_context(
+    paragraphs: List[Paragraph],
+    index: int,
+    context_lines: int,
+    path: Path,
+) -> None:
+    start = max(0, index - context_lines)
+    end = min(len(paragraphs), index + context_lines + 1)
+    print()
+    print(
+        f"Paragraph {index + 1} requires phonetics in {_relative_path(path)}:"
+    )
+    for position in range(start, end):
+        paragraph = paragraphs[position]
+        style = _style_name(paragraph.style) or "<No style>"
+        text = paragraph.text.strip() or "<EMPTY>"
+        text = text.replace("\n", "\\n")
+        offset = position - index
+        prefix = f"{offset:+d} [{style}] "
+        line = prefix + text
+        if position == index:
+            line = _colorize(line, _Color.CYAN)
+        print(line)
+    print()
+
+
+def _prompt_user() -> str:
+    while True:
+        choice = input("Insert phonetics here? [Y]es/[n]o/[s]kip file/[q]uit: ").strip().lower()
+        if choice in {"", "y", "yes"}:
+            return "yes"
+        if choice in {"n", "no"}:
+            return "no"
+        if choice in {"s", "skip"}:
+            return "skip_file"
+        if choice in {"q", "quit"}:
+            return "quit"
+        print("Please answer with Y, n, s, or q.")
+
+
+def _style_name(style) -> Optional[str]:
+    if style is None:
+        return None
+    return getattr(style, "name", None) or str(style)
+
+
+def _colorize(text: str, color: str) -> str:
+    if not COLOR_ENABLED:
+        return text
+    return f"{color}{text}{_Color.RESET}"
+
+
+def _relative_path(path: Path) -> str:
+    return os.path.relpath(path, Path.cwd())
+
+
+def _ensure_style_exists(document: Document, style_name: str) -> None:
+    try:
+        document.styles[style_name]
+    except KeyError as error:
+        raise ValueError(
+            f"Style '{style_name}' was not found in this document."
+        ) from error
+
+
+def _iter_paragraphs(parent) -> Iterable[Paragraph]:
+    if isinstance(parent, DocxDocument):
+        parent_element = parent.element.body
+    elif isinstance(parent, _Cell):
+        parent_element = parent._tc
+    else:
+        parent_element = parent
+    for child in parent_element.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, parent)
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from _iter_paragraphs(cell)
+
+
+def _safe_save_document(document: Document, destination: Path) -> None:
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f"{destination.stem}_",
+        suffix=destination.suffix,
+        dir=str(destination.parent),
+        delete=False,
+    ) as tmp_file:
+        temp_path = Path(tmp_file.name)
+    try:
+        document.save(temp_path)
+        temp_path.replace(destination)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def _get_generate_phonetics_module():
+    global _GP_MODULE
+    if _GP_MODULE is not None:
+        return _GP_MODULE
+    if not GENERATE_PHONETICS_PATH.exists():
+        raise FileNotFoundError(
+            f"Unable to locate '{GENERATE_PHONETICS_PATH}' needed for tibskrit transliteration."
+        )
+    loader = SourceFileLoader(
+        "generate_phonetics_module",
+        str(GENERATE_PHONETICS_PATH),
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise RuntimeError("Failed to load generate-phonetics module.")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    _GP_MODULE = module
+    return module
+
+
+def _build_mantra_segments(
+    module,
+    paragraph: Paragraph,
+    skip_char_style: Optional[str],
+    mantra_char_style: Optional[str],
+) -> List[Tuple[str, Optional[str]]]:
+    source_text = module._paragraph_text_for_phonetics(paragraph, skip_char_style)
+    if not source_text.strip():
+        return []
+    transliterated = module._transliterate_mantra_with_tibskrit(source_text).strip()
+    if not transliterated:
+        return []
+    segments: List[Tuple[str, Optional[str]]] = [(transliterated, None)]
+    if module._needs_gyur_suffix(paragraph, skip_char_style):
+        module._append_suffix_to_segments(segments, module.GYUR_SUFFIX)
+    return segments
+
+
+def _find_existing_phonetics(
+    paragraphs: List[Paragraph],
+    index: int,
+    phonetics_style: str,
+) -> Optional[int]:
+    for offset in (1, 2):
+        target_idx = index + offset
+        if target_idx >= len(paragraphs):
+            break
+        target_style = _style_name(paragraphs[target_idx].style)
+        if target_style == phonetics_style:
+            return offset
+    return None
+
+
+if __name__ == "__main__":
+    main()

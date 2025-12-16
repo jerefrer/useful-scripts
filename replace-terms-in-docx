@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""Bulk replace terms in DOCX files (with dry-run and interactive modes)."""
+from __future__ import annotations
+
+import argparse
+import csv
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List, Sequence, Tuple
+
+try:
+    from docx import Document
+    from docx.document import Document as DocxDocument
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import _Cell, Table
+    from docx.text.paragraph import Paragraph
+except ImportError:  # pragma: no cover - CLI ergonomics
+    print("Error: python-docx library not found.", file=sys.stderr)
+    print("Install it with: pip install python-docx", file=sys.stderr)
+    sys.exit(1)
+
+
+@dataclass
+class ReplacementResult:
+    replacements: int = 0
+    skip_file: bool = False
+    quit_requested: bool = False
+
+
+class QuitRequested(RuntimeError):
+    """Signal that interactive user requested to quit immediately."""
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Replace occurrences of terms inside DOCX files while preserving run styles."
+            " You may supply individual replacements via --term OLD NEW or load a CSV"
+            " mapping (two columns: original,replacement)."
+        )
+    )
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help="DOCX files or folders to process",
+    )
+    parser.add_argument(
+        "--term",
+        nargs=2,
+        action="append",
+        metavar=("FROM", "TO"),
+        help="Replacement pair; may be provided multiple times",
+    )
+    parser.add_argument(
+        "--csv",
+        help="CSV file with two columns (from,to) containing replacements",
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Process DOCX files inside folders recursively",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would change without modifying any files",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Prompt before each replacement (confirm/skip/skip-file/quit)",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.dry_run and args.interactive:
+        print("Error: --dry-run and --interactive cannot be used together.", file=sys.stderr)
+        return 2
+
+    try:
+        replacements = _load_replacements(args.term, args.csv)
+    except Exception as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 2
+
+    if not replacements:
+        print("Error: no replacements provided. Use --term or --csv.", file=sys.stderr)
+        return 2
+
+    docx_paths = _collect_docx_paths(args.paths, args.recursive)
+    if not docx_paths:
+        print("Warning: no DOCX files found.", file=sys.stderr)
+        return 1
+
+    total_files = 0
+    modified_files = 0
+    total_replacements = 0
+
+    try:
+        for docx_path in docx_paths:
+            total_files += 1
+            result = _process_document(
+                docx_path,
+                replacements,
+                dry_run=args.dry_run,
+                interactive=args.interactive,
+            )
+            total_replacements += result.replacements
+            if result.replacements and not args.dry_run:
+                modified_files += 1
+            if result.skip_file:
+                continue
+    except QuitRequested:
+        print("Interactive session aborted by user.")
+        return 1
+
+    summary = (
+        f"Processed {total_files} file(s); "
+        f"{'would replace' if args.dry_run else 'replaced'} {total_replacements} occurrence(s)."
+    )
+    if not args.dry_run:
+        summary += f" Modified {modified_files} file(s)."
+    print(summary)
+    return 0 if total_replacements or args.dry_run else 1
+
+
+def _load_replacements(term_pairs: Sequence[Sequence[str]] | None, csv_path: str | None) -> List[Tuple[str, str]]:
+    replacements: List[Tuple[str, str]] = []
+    if term_pairs:
+        for from_text, to_text in term_pairs:
+            if not from_text:
+                raise ValueError("Replacement source term cannot be empty.")
+            replacements.append((from_text, to_text))
+    if csv_path:
+        csv_file = Path(csv_path).expanduser()
+        if not csv_file.is_file():
+            raise FileNotFoundError(csv_file)
+        with csv_file.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.reader(handle)
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                from_text = row[0].strip()
+                to_text = row[1]
+                if from_text:
+                    replacements.append((from_text, to_text))
+    return replacements
+
+
+def _collect_docx_paths(inputs: Sequence[str], recursive: bool) -> List[Path]:
+    paths: List[Path] = []
+    for path_str in inputs:
+        path = Path(path_str).expanduser()
+        if not path.exists():
+            print(f"Warning: path not found, skipping: {path}", file=sys.stderr)
+            continue
+        if path.is_file():
+            if _is_valid_docx(path):
+                paths.append(path)
+        elif path.is_dir():
+            iterator: Iterable[Path]
+            if recursive:
+                iterator = path.rglob("*.docx")
+            else:
+                iterator = path.glob("*.docx")
+            for candidate in iterator:
+                if _is_valid_docx(candidate):
+                    paths.append(candidate)
+        else:
+            print(f"Warning: unsupported path type, skipping: {path}", file=sys.stderr)
+    return sorted(paths)
+
+
+def _is_valid_docx(path: Path) -> bool:
+    return path.suffix.lower() == ".docx" and not path.name.startswith("~$")
+
+
+def _process_document(
+    docx_path: Path,
+    replacements: Sequence[Tuple[str, str]],
+    *,
+    dry_run: bool,
+    interactive: bool,
+) -> ReplacementResult:
+    document = Document(docx_path)
+    total_replacements = 0
+    try:
+        for paragraph in _iter_paragraphs(document):
+            result = _process_paragraph(
+                paragraph,
+                docx_path,
+                replacements,
+                dry_run=dry_run,
+                interactive=interactive,
+            )
+            total_replacements += result.replacements
+            if result.skip_file:
+                return ReplacementResult(replacements=total_replacements, skip_file=True)
+    except QuitRequested:
+        raise
+
+    if total_replacements and not dry_run:
+        document.save(docx_path)
+    return ReplacementResult(replacements=total_replacements)
+
+
+def _process_paragraph(
+    paragraph: Paragraph,
+    docx_path: Path,
+    replacements: Sequence[Tuple[str, str]],
+    *,
+    dry_run: bool,
+    interactive: bool,
+) -> ReplacementResult:
+    replaced_here = 0
+    for run in paragraph.runs:
+        if not run.text:
+            continue
+        result = _process_run(
+            run,
+            paragraph,
+            docx_path,
+            replacements,
+            dry_run=dry_run,
+            interactive=interactive,
+        )
+        replaced_here += result.replacements
+        if result.skip_file or result.quit_requested:
+            return ReplacementResult(
+                replacements=replaced_here,
+                skip_file=result.skip_file,
+                quit_requested=result.quit_requested,
+            )
+    return ReplacementResult(replacements=replaced_here)
+
+
+def _process_run(
+    run,
+    paragraph: Paragraph,
+    docx_path: Path,
+    replacements: Sequence[Tuple[str, str]],
+    *,
+    dry_run: bool,
+    interactive: bool,
+) -> ReplacementResult:
+    text = run.text
+    total_replacements = 0
+    for source_text, target_text in replacements:
+        start_idx = 0
+        while True:
+            match_index = text.find(source_text, start_idx)
+            if match_index == -1 or not source_text:
+                break
+            context = _format_occurrence_context(paragraph, source_text, match_index)
+            if dry_run:
+                _print_dry_run(docx_path, paragraph, source_text, target_text, context)
+                start_idx = match_index + len(source_text)
+                continue
+            if interactive:
+                decision = _prompt_user(docx_path, source_text, target_text, context)
+                if decision == "y":
+                    text = text[:match_index] + target_text + text[match_index + len(source_text) :]
+                    start_idx = match_index + len(target_text)
+                    total_replacements += 1
+                elif decision == "n":
+                    start_idx = match_index + len(source_text)
+                elif decision == "s":
+                    return ReplacementResult(replacements=total_replacements, skip_file=True)
+                elif decision == "q":
+                    raise QuitRequested()
+                continue
+            text = text[:match_index] + target_text + text[match_index + len(source_text) :]
+            start_idx = match_index + len(target_text)
+            total_replacements += 1
+    if total_replacements and not dry_run:
+        run.text = text
+    return ReplacementResult(replacements=total_replacements)
+
+
+def _prompt_user(docx_path: Path, source: str, target: str, context: str) -> str:
+    prompt = (
+        f"File: {docx_path}\n"
+        f"Replace '{source}' -> '{target}' in context:\n"
+        f"    {context}\n"
+        "Action? [y]es / [n]o / [s]kip file / [q]uit: "
+    )
+    while True:
+        choice = input(prompt).strip().lower()
+        if choice in {"y", "n", "s", "q"}:
+            return choice
+        print("Please enter y, n, s, or q.")
+
+
+def _print_dry_run(
+    docx_path: Path,
+    paragraph: Paragraph,
+    source_text: str,
+    target_text: str,
+    context: str,
+) -> None:
+    style_name = paragraph.style.name if paragraph.style else "(no style)"
+    print(
+        f"[dry-run] {docx_path} | style={style_name} | '{source_text}' -> '{target_text}'\n"
+        f"    {context}"
+    )
+
+
+def _format_occurrence_context(paragraph: Paragraph, source_text: str, match_idx: int, *, window: int = 80) -> str:
+    paragraph_text = paragraph.text or ""
+    start = max(0, match_idx - window)
+    end = min(len(paragraph_text), match_idx + len(source_text) + window)
+    snippet = paragraph_text[start:end].replace("\n", " ")
+    return snippet.strip()
+
+
+def _iter_paragraphs(parent) -> Iterable[Paragraph]:
+    if isinstance(parent, DocxDocument):
+        container = parent.element.body
+    elif isinstance(parent, _Cell):
+        container = parent._tc
+    else:
+        container = parent
+    for child in container.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, parent)
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from _iter_paragraphs(cell)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

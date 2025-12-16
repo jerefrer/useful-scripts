@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""Generate a PPTX deck showing the slide number in white on a dark-blue background."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import sys
+from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
+
+try:
+    from pptx import Presentation
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+    from pptx.util import Pt
+except ImportError:  # pragma: no cover - CLI ergonomics only
+    print("Error: python-pptx library not found.", file=sys.stderr)
+    print("Install it with: pip install python-pptx", file=sys.stderr)
+    sys.exit(1)
+
+try:  # Optional dependency when generating QR codes
+    import qrcode
+except ImportError:  # pragma: no cover - optional feature only
+    qrcode = None
+
+DARK_BLUE = RGBColor(1, 26, 74)
+FONT_NAME = "Arial"
+FONT_SIZE_PT = 240
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Create a PowerPoint deck containing N slides, each showing its slide number."
+    )
+    parser.add_argument(
+        "count",
+        type=int,
+        help="Number of slides to generate (must be positive).",
+    )
+    parser.add_argument(
+        "output",
+        nargs="?",
+        default="slide-numbers.pptx",
+        help="Path to the PPTX file to create (default: slide-numbers.pptx).",
+    )
+    parser.add_argument(
+        "--version-number-right",
+        help="Optional version number (e.g. 'v2.1') for the bottom-right footer.",
+    )
+    parser.add_argument(
+        "--language-right",
+        help="Optional language label (e.g. 'English') for the bottom-right footer.",
+    )
+    parser.add_argument(
+        "--download-url-right",
+        help="Optional URL to encode as a QR code in the bottom-right footer.",
+    )
+    parser.add_argument(
+        "--show-url-right",
+        action="store_true",
+        help="Show the bottom-right URL text next to its QR code (default hidden).",
+    )
+    parser.add_argument(
+        "--version-number-left",
+        help="Optional version number to show in the bottom-left footer.",
+    )
+    parser.add_argument(
+        "--language-left",
+        help="Optional language label for the bottom-left footer.",
+    )
+    parser.add_argument(
+        "--download-url-left",
+        help="Optional URL/QR for the bottom-left footer.",
+    )
+    parser.add_argument(
+        "--show-url-left",
+        action="store_true",
+        help="Show the bottom-left URL text next to its QR code (default hidden).",
+    )
+    parser.add_argument(
+        "--mapping-csv",
+        help="Path to a CSV file mapping main pages to alternate language pages (col1=main, col2=alt).",
+    )
+    parser.add_argument(
+        "--header-main",
+        default="FR/EN",
+        help="Header label for the main language column (default: FR/EN).",
+    )
+    parser.add_argument(
+        "--header-alt",
+        default="CH",
+        help="Header label for the alternate language column (default: CH).",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.count <= 0:
+        print("Error: count must be a positive integer.", file=sys.stderr)
+        return 2
+    right_download = args.download_url_right
+    left_download = args.download_url_left
+    right_version = args.version_number_right
+    right_language = args.language_right
+    left_version = args.version_number_left
+    left_language = args.language_left
+
+    if any([right_download, left_download]) and qrcode is None:
+        print(
+            "Error: generating a QR code requires the 'qrcode' package (pip install qrcode[pil]).",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Parse mapping CSV if provided
+    mapping_config: MappingConfig | None = None
+    if args.mapping_csv:
+        mapping_path = Path(args.mapping_csv).expanduser()
+        if not mapping_path.exists():
+            print(f"Error: mapping CSV file not found: {mapping_path}", file=sys.stderr)
+            return 2
+        mapping_config = _parse_mapping_csv(mapping_path)
+        if not mapping_config.sections:
+            print("Error: mapping CSV is empty or invalid.", file=sys.stderr)
+            return 2
+
+    output_path = Path(args.output).expanduser()
+    presentation = Presentation()
+    slide_width = presentation.slide_width
+    slide_height = presentation.slide_height
+
+    for slide_number in range(1, args.count + 1):
+        slide = presentation.slides.add_slide(presentation.slide_layouts[6])  # Blank layout
+        _set_dark_blue_background(slide)
+        _populate_number(
+            slide,
+            slide_number,
+            slide_width,
+            slide_height,
+            mapping_config=mapping_config,
+            header_main=args.header_main,
+            header_alt=args.header_alt,
+        )
+        _add_footer_slot(
+            slide,
+            slide_width,
+            slide_height,
+            position="right",
+            version_number=right_version,
+            language_label=right_language,
+            download_url=right_download,
+            show_url=args.show_url_right,
+        )
+        _add_footer_slot(
+            slide,
+            slide_width,
+            slide_height,
+            position="left",
+            version_number=left_version,
+            language_label=left_language,
+            download_url=args.download_url_left,
+            show_url=args.show_url_left,
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    presentation.save(output_path)
+    print(f"Created {output_path} containing {args.count} slide(s).")
+    return 0
+
+
+@dataclass
+class SectionMapping:
+    """Represents a section mapping from the CSV."""
+    main_page: int
+    alt_page: int | None  # None if 2-column CSV (no alternate language)
+    running_header: str | None
+
+
+@dataclass
+class MappingConfig:
+    """Configuration parsed from the mapping CSV."""
+    sections: list[SectionMapping]
+    has_alt_language: bool  # True if 3-column CSV
+
+
+def _parse_mapping_csv(csv_path: Path) -> MappingConfig:
+    """Parse CSV with 2 or 3 columns.
+    
+    2 columns: main_page, running_header (no alternate language)
+    3 columns: main_page, alt_page, running_header
+    """
+    sections = []
+    has_alt_language = None
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if len(row) < 2:
+                continue
+            try:
+                main_page = int(row[0].strip())
+            except ValueError:
+                continue  # Skip non-numeric rows (e.g., headers)
+            
+            # Detect format based on whether second column is numeric
+            if has_alt_language is None:
+                try:
+                    int(row[1].strip())
+                    has_alt_language = len(row) >= 3
+                except ValueError:
+                    has_alt_language = False
+            
+            if has_alt_language:
+                # 3-column format: main_page, alt_page, running_header
+                try:
+                    alt_page = int(row[1].strip())
+                except ValueError:
+                    continue
+                running_header = row[2].strip() if len(row) >= 3 and row[2].strip() else None
+                sections.append(SectionMapping(main_page, alt_page, running_header))
+            else:
+                # 2-column format: main_page, running_header
+                running_header = row[1].strip() if row[1].strip() else None
+                sections.append(SectionMapping(main_page, None, running_header))
+    
+    sections.sort(key=lambda x: x.main_page)
+    return MappingConfig(sections=sections, has_alt_language=has_alt_language or False)
+
+
+def _get_section_info(slide_number: int, mapping: MappingConfig) -> tuple[str | None, str | None]:
+    """Get the alternate page display and running header for a given slide number.
+    
+    Returns (alt_display, running_header).
+    """
+    current_section: SectionMapping | None = None
+    is_first_in_section = False
+    
+    for i, section in enumerate(mapping.sections):
+        if slide_number < section.main_page:
+            break
+        # Check if there's a next section
+        next_main = mapping.sections[i + 1].main_page if i + 1 < len(mapping.sections) else None
+        if next_main is None or slide_number < next_main:
+            current_section = section
+            is_first_in_section = (slide_number == section.main_page)
+            break
+    
+    if current_section is None:
+        return None, None
+    
+    # Build alt display
+    alt_display = None
+    if mapping.has_alt_language and current_section.alt_page is not None:
+        if is_first_in_section:
+            alt_display = str(current_section.alt_page)
+        else:
+            alt_display = f"{current_section.alt_page}+"
+    
+    return alt_display, current_section.running_header
+
+
+def _set_dark_blue_background(slide) -> None:
+    fill = slide.background.fill
+    fill.solid()
+    fill.fore_color.rgb = DARK_BLUE
+
+
+def _populate_number(
+    slide,
+    slide_number: int,
+    slide_width,
+    slide_height,
+    *,
+    mapping_config: MappingConfig | None = None,
+    header_main: str = "FR/EN",
+    header_alt: str = "CH",
+) -> None:
+    if mapping_config is None:
+        # Simple mode: just show the slide number (no CSV provided)
+        _add_simple_number(slide, str(slide_number), slide_width, slide_height)
+    else:
+        alt_display, running_header = _get_section_info(slide_number, mapping_config)
+        _add_mapped_number(
+            slide,
+            slide_number,
+            slide_width,
+            slide_height,
+            alt_display=alt_display,
+            running_header=running_header,
+            header_main=header_main,
+            header_alt=header_alt,
+            has_alt_language=mapping_config.has_alt_language,
+        )
+
+
+def _add_simple_number(slide, text: str, slide_width, slide_height) -> None:
+    """Add a simple centered page number."""
+    top_padding = Pt(80)
+    bottom_padding = Pt(160)
+    textbox = slide.shapes.add_textbox(0, top_padding, slide_width, slide_height - top_padding - bottom_padding)
+    text_frame = textbox.text_frame
+    text_frame.margin_top = 0
+    text_frame.margin_bottom = 0
+    text_frame.vertical_anchor = MSO_ANCHOR.TOP
+    text_frame.word_wrap = False
+    paragraph = text_frame.paragraphs[0]
+    paragraph.alignment = PP_ALIGN.CENTER
+    run = paragraph.add_run()
+    run.text = text
+    font = run.font
+    font.name = FONT_NAME
+    font.size = Pt(FONT_SIZE_PT)
+    font.bold = True
+    font.color.rgb = RGBColor(255, 255, 255)
+
+
+def _add_mapped_number(
+    slide,
+    slide_number: int,
+    slide_width,
+    slide_height,
+    *,
+    alt_display: str | None,
+    running_header: str | None,
+    header_main: str,
+    header_alt: str,
+    has_alt_language: bool,
+) -> None:
+    """Add page number with optional running header and alternate language."""
+    # Running header at top
+    if running_header:
+        header_box = slide.shapes.add_textbox(0, Pt(20), slide_width, Pt(60))
+        tf = header_box.text_frame
+        tf.margin_top = 0
+        tf.margin_bottom = 0
+        tf.word_wrap = True
+        para = tf.paragraphs[0]
+        para.alignment = PP_ALIGN.CENTER
+        run = para.add_run()
+        run.text = running_header
+        font = run.font
+        font.name = FONT_NAME
+        font.size = Pt(36)
+        font.bold = True
+        font.color.rgb = RGBColor(180, 180, 180)
+    
+    # Main content area
+    top_padding = Pt(100) if running_header else Pt(80)
+    bottom_padding = Pt(160)
+    textbox = slide.shapes.add_textbox(0, top_padding, slide_width, slide_height - top_padding - bottom_padding)
+    text_frame = textbox.text_frame
+    text_frame.margin_top = 0
+    text_frame.margin_bottom = 0
+    text_frame.vertical_anchor = MSO_ANCHOR.TOP
+    text_frame.word_wrap = False
+    
+    if has_alt_language and alt_display:
+        # Two-column layout with language headers
+        header_para = text_frame.paragraphs[0]
+        header_para.alignment = PP_ALIGN.CENTER
+        run = header_para.add_run()
+        run.text = f"{header_main}  |  {header_alt}"
+        font = run.font
+        font.name = FONT_NAME
+        font.size = Pt(60)
+        font.bold = True
+        font.color.rgb = RGBColor(180, 180, 180)
+        
+        number_para = text_frame.add_paragraph()
+        number_para.alignment = PP_ALIGN.CENTER
+        run = number_para.add_run()
+        run.text = f"{slide_number}  |  {alt_display}"
+        font = run.font
+        font.name = FONT_NAME
+        font.size = Pt(FONT_SIZE_PT)
+        font.bold = True
+        font.color.rgb = RGBColor(255, 255, 255)
+    else:
+        # Single page number (no alternate language)
+        paragraph = text_frame.paragraphs[0]
+        paragraph.alignment = PP_ALIGN.CENTER
+        run = paragraph.add_run()
+        run.text = str(slide_number)
+        font = run.font
+        font.name = FONT_NAME
+        font.size = Pt(FONT_SIZE_PT)
+        font.bold = True
+        font.color.rgb = RGBColor(255, 255, 255)
+
+
+def _add_footer_slot(
+    slide,
+    slide_width,
+    slide_height,
+    *,
+    position: str,
+    version_number: str | None,
+    language_label: str | None,
+    download_url: str | None,
+    show_url: bool,
+) -> None:
+    if not (version_number or language_label or download_url):
+        return
+
+    margin = Pt(42)
+    text_height = Pt(48)
+    qr_size = Pt(100)
+    spacing = Pt(16)
+    text_width = Pt(420)
+
+    version_lines = _split_label_lines(version_number)
+    language_lines = _split_label_lines(language_label)
+    url_lines = _split_label_lines(download_url) if (download_url and show_url) else []
+    has_text = bool(version_lines or language_lines or url_lines)
+
+    qr_top = slide_height - margin - qr_size
+    text_top = qr_top + qr_size - text_height
+
+    if position == "right":
+        qr_left = slide_width - margin - qr_size
+        text_left = qr_left - spacing - text_width
+        text_align = PP_ALIGN.RIGHT
+    else:
+        qr_left = margin
+        text_left = qr_left + qr_size + spacing
+        text_align = PP_ALIGN.LEFT
+
+    if download_url and qrcode is not None:
+        slide.shapes.add_picture(
+            _build_qr_stream(download_url),
+            qr_left,
+            qr_top,
+            width=qr_size,
+            height=qr_size,
+        )
+
+    if has_text:
+        textbox = slide.shapes.add_textbox(text_left, text_top, text_width, text_height)
+        text_frame = textbox.text_frame
+        text_frame.word_wrap = True
+        text_frame.margin_top = 0
+        text_frame.margin_bottom = 0
+        text_frame.vertical_anchor = MSO_ANCHOR.BOTTOM
+        text_frame.clear()
+
+        def _add_line(line: str, *, font_size: int, first: bool) -> None:
+            paragraph = text_frame.paragraphs[0] if first else text_frame.add_paragraph()
+            paragraph.alignment = text_align
+            paragraph.text = line
+            paragraph.space_after = Pt(0)
+            run = paragraph.runs[0]
+            font = run.font
+            font.name = FONT_NAME
+            font.size = Pt(font_size)
+            font.bold = True
+            font.color.rgb = RGBColor(220, 220, 220)
+
+        first = True
+        for line in version_lines:
+            _add_line(line, font_size=32, first=first)
+            first = False
+        for line in language_lines:
+            _add_line(line, font_size=24, first=first)
+            first = False
+        for line in url_lines:
+            _add_line(line, font_size=16, first=first)
+            first = False
+
+
+def _build_qr_stream(content: str) -> BytesIO:
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=8,
+        border=2,
+    )
+    qr.add_data(content)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white")
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
+def _split_label_lines(value: str | None) -> list[str]:
+    if not value:
+        return []
+    normalized = value.replace("\\n", "\n").replace("||", "\n")
+    return [line.strip() for line in normalized.splitlines() if line.strip()]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""Apply a character style to Sanskrit prefixes at the start of phonetics/translation paragraphs."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from copy import deepcopy
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List, Sequence, Tuple
+
+try:
+    from docx import Document
+    from docx.document import Document as DocxDocument
+    from docx.enum.style import WD_STYLE_TYPE
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import _Cell, Table
+    from docx.text.paragraph import Paragraph
+    from docx.text.run import Run
+except ImportError:  # pragma: no cover - CLI ergonomics
+    print("Error: python-docx library not found.", file=sys.stderr)
+    print("Install it with: pip install python-docx", file=sys.stderr)
+    sys.exit(1)
+
+DEFAULT_TARGET_STYLES = (
+    "Verse Phonetics",
+    "Verse Translation",
+    "Inserted Verse Phonetics",
+    "Inserted Verse Translation"
+)
+TIBETAN_STYLES = {
+    "Verse Tibetan",
+    "Inserted Verse Tibetan",
+}
+DEFAULT_CHAR_STYLE = "Sanskrit at the beginning"
+DOCX_SUFFIX = ".docx"
+TEMP_PREFIX = "~$"
+ANSI_HIGHLIGHT = "\x1b[38;5;214m"
+ANSI_RESET = "\x1b[0m"
+MIN_SEPARATOR = 3  # minimum number of consecutive spaces denoting end of prefix
+MAX_PREFIX_WORDS = 5
+AUTO_PREFIXES = {
+    "a",
+    "oṁ",
+    "āḥ",
+    "hūṁ",
+    "oṁ āḥ ḥūṁ",
+    "bhrūṁ",
+    "bhrūṁ bhrūṁ bhrūṁ",
+    "bhyoḥ",
+    "ema",
+    "éma",
+    "emaho",
+    "émaho",
+    "kyého",
+    "ho",
+    "hoḥ",
+    "hūṁ a",
+    "hūṁ bhyoḥ",
+    "hūṁ hrīḥ",
+    "hūṁ hūṁ hūṁ",
+    "hūṁ jaḥ",
+    "jaḥ",
+    "tāṁ",
+    "raṁ",
+    "yaṁ",
+    "khaṁ",
+    "namo",
+    "oṁ āḥ hūṁ",
+    "oṃ svasti!",
+    "oṃ svasti",
+    "oṁ svasti!",
+    "oṁ svasti",
+}
+def normalize_prefix(text: str) -> str:
+    return " ".join(text.strip().split()).casefold()
+
+
+AUTO_PREFIXES_NORMALIZED = {normalize_prefix(prefix) for prefix in AUTO_PREFIXES}
+
+
+@dataclass
+class Args:
+    paths: Sequence[Path]
+    styles: Tuple[str, ...]
+    char_style: str
+    dry_run: bool
+    recursive: bool
+    debug: bool
+
+
+@dataclass
+class Occurrence:
+    doc_path: Path
+    paragraph_index: int
+    style_name: str
+    text: str
+    start: int
+    end: int
+    tibetan_text: str
+
+
+def parse_args() -> Args:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Scan DOCX files for phonetics/translation paragraphs that begin with Sanskrit text "
+            "and apply a character style to that prefix."
+        )
+    )
+    parser.add_argument("paths", nargs="+", type=Path, help="DOCX files or folders to scan.")
+    parser.add_argument(
+        "--style",
+        dest="styles",
+        action="append",
+        help=(
+            "Paragraph style to inspect (can be specified multiple times). "
+            "Defaults to Verse/Inserted Phonetics & Translation styles."
+        ),
+    )
+    parser.add_argument(
+        "--character-style",
+        default=DEFAULT_CHAR_STYLE,
+        dest="char_style",
+        help=f"Character style to apply to the Sanskrit prefix (default: {DEFAULT_CHAR_STYLE}).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do not modify files; instead list every match and highlight the affected text.",
+    )
+    parser.add_argument(
+        "--non-recursive",
+        action="store_true",
+        help="Only inspect DOCX files directly under each provided folder (no recursion).",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print verbose information about file discovery and match detection.",
+    )
+    parsed = parser.parse_args()
+    styles = tuple(parsed.styles) if parsed.styles else DEFAULT_TARGET_STYLES
+    if not styles:
+        parser.error("At least one --style must be provided.")
+    return Args(
+        paths=[path.expanduser() for path in parsed.paths],
+        styles=styles,
+        char_style=parsed.char_style,
+        dry_run=parsed.dry_run,
+        recursive=not parsed.non_recursive,
+        debug=parsed.debug,
+    )
+
+
+def main() -> int:
+    args = parse_args()
+    if args.debug:
+        print("[debug] Starting highlight-sanskrit-prefix")
+        for path in args.paths:
+            print(f"[debug] Input path: {path}")
+    docx_files = collect_docx_files(args.paths, recursive=args.recursive, debug=args.debug)
+    if not docx_files:
+        print("No DOCX files found to inspect.", file=sys.stderr)
+        return 1
+    if args.debug:
+        print(f"[debug] Discovered {len(docx_files)} DOCX file(s).")
+        for doc in docx_files[:20]:
+            print(f"[debug] -> {doc}")
+
+    total_matches = 0
+    total_updated = 0
+    for doc_path in docx_files:
+        matches, updated = process_document(
+            doc_path,
+            args.styles,
+            args.char_style,
+            args.dry_run,
+            args.debug,
+        )
+        total_matches += matches
+        total_updated += updated
+        if args.debug:
+            print(f"[debug] {doc_path}: matches={matches}, updated={updated}")
+
+    if args.dry_run:
+        print(f"Dry run complete. Detected {total_matches} Sanskrit-prefix paragraph(s).")
+        return 0 if total_matches else 1
+
+    if total_updated:
+        print(f"Updated {total_updated} paragraph(s) across {len(docx_files)} file(s).")
+        return 0
+
+    print("No paragraphs required updates.")
+    return 1
+
+
+def collect_docx_files(paths: Sequence[Path], *, recursive: bool, debug: bool = False) -> List[Path]:
+    collected: List[Path] = []
+    seen = set()
+    for base in paths:
+        if not base.exists():
+            print(f"Warning: {base} does not exist (skipping).", file=sys.stderr)
+            continue
+        if base.is_file() and _is_valid_docx(base) and base not in seen:
+            collected.append(base)
+            seen.add(base)
+            continue
+        if base.is_dir():
+            iterator: Iterable[Path]
+            if recursive:
+                iterator = base.rglob(f"*{DOCX_SUFFIX}")
+            else:
+                iterator = base.glob(f"*{DOCX_SUFFIX}")
+            for docx_path in iterator:
+                if _is_valid_docx(docx_path) and docx_path not in seen:
+                    collected.append(docx_path)
+                    seen.add(docx_path)
+        else:
+            print(f"Warning: {base} is neither a DOCX file nor a directory (skipping).", file=sys.stderr)
+    collected_sorted = sorted(collected)
+    if debug:
+        print(f"[debug] collect_docx_files -> {len(collected_sorted)} files")
+    return collected_sorted
+
+
+def _is_valid_docx(path: Path) -> bool:
+    return path.suffix.lower() == DOCX_SUFFIX and not path.name.startswith(TEMP_PREFIX)
+
+
+def process_document(
+    doc_path: Path,
+    target_styles: Tuple[str, ...],
+    char_style_name: str,
+    dry_run: bool,
+    debug: bool,
+) -> Tuple[int, int]:
+    document = Document(doc_path)
+    if not dry_run:
+        ensure_character_style(document, char_style_name)
+    paragraphs = list(_iter_paragraphs(document))
+    matches = 0
+    updated = 0
+    skip_remaining = False
+    last_tibetan_text = ""
+    for index, paragraph in enumerate(paragraphs, start=1):
+        style_name = paragraph.style.name if paragraph.style else ""
+        if style_name in TIBETAN_STYLES:
+            last_tibetan_text = paragraph.text.strip()
+            continue
+        if style_name not in target_styles:
+            continue
+        match = find_sanskrit_prefix(paragraph.text, debug=debug, context=f"{doc_path}#{index}")
+        if not match:
+            if debug:
+                sample = paragraph.text.strip()
+                if sample:
+                    print(
+                        f"[debug] {doc_path} paragraph {index}: no prefix match in '{sample[:80]}'"
+                    )
+            continue
+        start, end = match
+        prefix_text = paragraph.text[start:end]
+        normalized_prefix = normalize_prefix(prefix_text)
+        auto_apply = normalized_prefix in AUTO_PREFIXES_NORMALIZED
+        matches += 1
+        if prefix_already_styled(paragraph, start, end, char_style_name):
+            if dry_run and debug:
+                print(
+                    f"[debug] {doc_path} paragraph {index}: prefix already styled, skipping output"
+                )
+            continue
+        if dry_run:
+            print_dry_run_occurrence(
+                Occurrence(
+                    doc_path=doc_path,
+                    paragraph_index=index,
+                    style_name=style_name,
+                    text=paragraph.text,
+                    start=start,
+                    end=end,
+                    tibetan_text=last_tibetan_text,
+                )
+            )
+            continue
+        should_apply = auto_apply
+        if not auto_apply:
+            decision = prompt_user_decision(
+                doc_path,
+                index,
+                style_name,
+                paragraph.text,
+                prefix_text,
+                last_tibetan_text,
+            )
+            if decision == "skip":
+                skip_remaining = True
+                break
+            if decision == "no":
+                continue
+            # yes decision
+            should_apply = True
+        if should_apply:
+            apply_char_style_to_range(paragraph, start, end, char_style_name)
+            updated += 1
+    if skip_remaining and debug:
+        print(f"[debug] Skipped remaining paragraphs in {doc_path} per user request")
+    if updated and not dry_run:
+        document.save(doc_path)
+    return matches, updated
+
+
+def print_dry_run_occurrence(occurrence: Occurrence) -> None:
+    highlighted = (
+        occurrence.text[: occurrence.start]
+        + ANSI_HIGHLIGHT
+        + occurrence.text[occurrence.start : occurrence.end]
+        + ANSI_RESET
+        + occurrence.text[occurrence.end :]
+    )
+    print(
+        f"{occurrence.doc_path} | paragraph {occurrence.paragraph_index} | style {occurrence.style_name}"
+    )
+    if occurrence.tibetan_text:
+        print(f"Tibetan: {occurrence.tibetan_text}")
+    print(highlighted)
+    print()
+
+
+def find_sanskrit_prefix(text: str, *, debug: bool = False, context: str = "") -> Tuple[int, int] | None:
+    if not text:
+        return None
+    stripped_leading = len(text) - len(text.lstrip())
+    body = text[stripped_leading:]
+    if not body:
+        return None
+    separator_index = _find_separator(body)
+    if separator_index is None:
+        if debug:
+            print(f"[debug] {context}: no separator of >={MIN_SEPARATOR} spaces found")
+        return None
+    prefix = body[:separator_index]
+    if not _valid_word_prefix(prefix):
+        if debug:
+            word_count = len([w for w in prefix.strip().split() if w])
+            print(f"[debug] {context}: prefix has {word_count} word(s), exceeds limit {MAX_PREFIX_WORDS}")
+        return None
+    return stripped_leading, stripped_leading + separator_index
+
+
+def _find_separator(text: str) -> int | None:
+    consecutive = 0
+    for idx, char in enumerate(text):
+        if char == " ":
+            consecutive += 1
+            if consecutive >= MIN_SEPARATOR:
+                return idx - consecutive + 1
+        else:
+            consecutive = 0
+    return None
+
+
+def _valid_word_prefix(segment: str) -> bool:
+    words = [w for w in segment.strip().split() if w]
+    if not words or len(words) > MAX_PREFIX_WORDS:
+        return False
+    return True
+
+
+def prefix_already_styled(
+    paragraph: Paragraph, start: int, end: int, char_style_name: str
+) -> bool:
+    needed = end - start
+    if needed <= 0:
+        return True
+    pos = 0
+    covered = 0
+    for run in paragraph.runs:
+        text = run.text or ""
+        length = len(text)
+        if length == 0:
+            continue
+        run_start = pos
+        run_end = pos + length
+        if run_end <= start:
+            pos = run_end
+            continue
+        if run_start >= end:
+            break
+        overlap_start = max(start, run_start)
+        overlap_end = min(end, run_end)
+        if overlap_start < overlap_end:
+            style_name = run.style.name if run.style else ""
+            if style_name != char_style_name:
+                return False
+            covered += overlap_end - overlap_start
+        pos = run_end
+    return covered >= needed
+
+
+def apply_char_style_to_range(paragraph: Paragraph, start: int, end: int, char_style_name: str) -> None:
+    if start >= end:
+        return
+    ensure_run_boundary(paragraph, start)
+    ensure_run_boundary(paragraph, end)
+    pos = 0
+    for run in paragraph.runs:
+        text = run.text or ""
+        length = len(text)
+        if length == 0:
+            continue
+        run_start = pos
+        run_end = pos + length
+        if run_end <= start:
+            pos = run_end
+            continue
+        if run_start >= end:
+            break
+        run.style = char_style_name
+        pos = run_end
+
+
+def ensure_run_boundary(paragraph: Paragraph, position: int) -> None:
+    if position <= 0:
+        return
+    total = len(paragraph.text or "")
+    if position >= total:
+        return
+    pos = 0
+    for run in paragraph.runs:
+        text = run.text or ""
+        length = len(text)
+        if length == 0:
+            continue
+        run_start = pos
+        run_end = pos + length
+        if run_start < position < run_end:
+            split_run_at(run, position - run_start)
+            return
+        pos = run_end
+
+
+def split_run_at(run: Run, split_index: int) -> None:
+    text = run.text or ""
+    if split_index <= 0 or split_index >= len(text):
+        return
+    left = text[:split_index]
+    right = text[split_index:]
+    run.text = left
+    new_r = deepcopy(run._r)
+    run._r.addnext(new_r)
+    new_run = Run(new_r, run._parent)
+    new_run.text = right
+
+
+def ensure_character_style(document: Document, style_name: str):
+    try:
+        return document.styles[style_name]
+    except KeyError:
+        style = document.styles.add_style(style_name, WD_STYLE_TYPE.CHARACTER)
+        return style
+
+
+def print_warning(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def _iter_paragraphs(parent) -> Iterable[Paragraph]:
+    if isinstance(parent, DocxDocument):
+        container = parent.element.body
+    elif isinstance(parent, _Cell):
+        container = parent._tc
+    else:
+        container = parent
+    for child in container.iterchildren():
+        if isinstance(child, CT_P):
+            yield Paragraph(child, parent)
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, parent)
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from _iter_paragraphs(cell)
+
+
+def prompt_user_decision(
+    doc_path: Path,
+    paragraph_index: int,
+    style_name: str,
+    full_text: str,
+    prefix_text: str,
+    tibetan_text: str,
+) -> str:
+    print("\n--- Interactive Decision ---")
+    print(f"Document: {doc_path}")
+    print(f"Paragraph #{paragraph_index} (style: {style_name})")
+    if tibetan_text:
+        print(f"Tibetan line: {tibetan_text}")
+    print(f"Full text: {full_text.strip()}")
+    print(f"Proposed prefix: '{prefix_text.strip()}'")
+    while True:
+        response = input("Apply character style? [Y/n/s]: ").strip().lower()
+        if response in {"", "y", "yes"}:
+            return "yes"
+        if response in {"n", "no"}:
+            return "no"
+        if response in {"s", "skip"}:
+            return "skip"
+        print("Please respond with Y, n, or s.")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

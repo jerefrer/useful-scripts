@@ -1,0 +1,1114 @@
+#!/usr/bin/env python3
+"""
+Google Drive Word Document Version Diff Generator
+
+This script compares the first and last versions of Word documents (.docx)
+stored in Google Drive and generates HTML diff files showing the changes.
+
+Supports both:
+- Local file paths (from a synced Google Drive folder)
+- Google Drive file/folder IDs
+
+Requirements:
+    pip install google-auth google-auth-oauthlib google-api-python-client python-docx
+
+Setup:
+    1. Go to https://console.cloud.google.com/
+    2. Create a project (or select existing)
+    3. Enable the Google Drive API
+    4. Create OAuth 2.0 credentials (Desktop application)
+    5. Download the credentials JSON and save as 'credentials.json' in the script directory
+
+Usage:
+    # Process a local file from synced Google Drive folder
+    gdrive-docx-diff "My Document.docx"
+    gdrive-docx-diff "./Subfolder/Document.docx"
+    
+    # Process a local folder
+    gdrive-docx-diff "./My Folder/"
+    
+    # Process using Google Drive ID
+    gdrive-docx-diff 1ABC123def456
+    
+    # Mix of files and folders
+    gdrive-docx-diff "./doc1.docx" "./Folder/" 1DriveID
+
+Output:
+    Creates an 'output_diffs' directory containing HTML diff files for each document.
+"""
+
+import argparse
+import difflib
+import html
+import io
+import os
+import socket
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+# Force IPv4 to work around IPv6 routing issues on some networks
+orig_getaddrinfo = socket.getaddrinfo
+def _getaddrinfo_ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+    return orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+socket.getaddrinfo = _getaddrinfo_ipv4_only
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+
+# If modifying scopes, delete token.json
+SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+
+# Output directory for diff files
+OUTPUT_DIR = Path('output_diffs')
+
+
+def parse_datetime(dt_string):
+    """Parse a datetime string in various formats."""
+    if not dt_string:
+        return None
+    
+    formats = [
+        '%Y-%m-%dT%H:%M:%S',
+        '%Y-%m-%dT%H:%M',
+        '%Y-%m-%d %H:%M:%S',
+        '%Y-%m-%d %H:%M',
+        '%Y-%m-%d',
+        '%d/%m/%Y',
+        '%d/%m/%Y %H:%M',
+    ]
+    
+    for fmt in formats:
+        try:
+            return datetime.strptime(dt_string, fmt)
+        except ValueError:
+            continue
+    
+    raise ValueError(f"Could not parse datetime: {dt_string}. Use format like '2024-01-15' or '2024-01-15T10:30:00'")
+
+
+def get_full_drive_path(service, file_id, cache=None):
+    """Get the full path of a file in Google Drive by traversing parents."""
+    if cache is None:
+        cache = {}
+    
+    path_parts = []
+    current_id = file_id
+    
+    while current_id:
+        if current_id in cache:
+            info = cache[current_id]
+        else:
+            try:
+                info = service.files().get(
+                    fileId=current_id,
+                    fields='name, parents'
+                ).execute()
+                cache[current_id] = info
+            except Exception:
+                break
+        
+        path_parts.insert(0, info.get('name', ''))
+        parents = info.get('parents', [])
+        current_id = parents[0] if parents else None
+    
+    return '/'.join(path_parts)
+
+
+def find_drive_id_by_path(service, local_path):
+    """
+    Find Google Drive file ID from a local path in a synced Google Drive folder.
+    
+    This searches by filename and matches the full path hierarchy.
+    """
+    path = Path(local_path).resolve()
+    filename = path.name
+    
+    # Search for files with this exact name
+    query = f"name = '{filename}' and trashed = false"
+    
+    results = service.files().list(
+        q=query,
+        fields='files(id, name, mimeType, parents)',
+        pageSize=100
+    ).execute()
+    
+    files = results.get('files', [])
+    
+    if not files:
+        return None
+    
+    if len(files) == 1:
+        return files[0]
+    
+    # Multiple files with same name - need to match by full path
+    # Extract folder names from local path
+    path_parts = list(path.parts)
+    
+    # Find the Google Drive root in the path (usually "Google Drive" or similar)
+    gdrive_markers = ['Google Drive', 'GoogleDrive', 'My Drive', 'Shared drives', '.shortcut-targets-by-id']
+    gdrive_idx = None
+    for i, part in enumerate(path_parts):
+        if any(marker.lower() in part.lower() for marker in gdrive_markers):
+            gdrive_idx = i
+            break
+    
+    if gdrive_idx is not None:
+        # Get the relative path within Google Drive (skip the marker and any ID folder after it)
+        relative_parts = path_parts[gdrive_idx + 1:]
+        # Skip shortcut ID folders (they look like random strings)
+        if relative_parts and len(relative_parts[0]) > 20 and relative_parts[0].replace('_', '').replace('-', '').isalnum():
+            relative_parts = relative_parts[1:]
+    else:
+        # Use the last few folder names from the path
+        relative_parts = path_parts[-4:] if len(path_parts) >= 4 else path_parts
+    
+    # Build expected path suffix for matching
+    expected_path_suffix = '/'.join(relative_parts)
+    print(f"  → Looking for path ending with: {expected_path_suffix}")
+    
+    # Get full Drive path for each candidate and find best match
+    cache = {}
+    best_match = None
+    best_score = 0
+    
+    for file_info in files:
+        drive_path = get_full_drive_path(service, file_info['id'], cache)
+        
+        # Score by how many path components match from the end
+        drive_parts = drive_path.split('/')
+        score = 0
+        for i, part in enumerate(reversed(relative_parts)):
+            if i < len(drive_parts) and drive_parts[-(i+1)] == part:
+                score += 1
+            else:
+                break
+        
+        if score > best_score:
+            best_score = score
+            best_match = file_info
+            best_match['_drive_path'] = drive_path
+    
+    if best_match:
+        if len(files) > 1:
+            print(f"  → Found {len(files)} files with same name, matched: {best_match.get('_drive_path', '')}")
+        return best_match
+    
+    # Fallback: return first match with warning
+    print(f"  Warning: Multiple files named '{filename}' found, could not determine best match, using first")
+    return files[0]
+
+
+def resolve_input_to_file_info(service, input_path):
+    """
+    Resolve an input (either a Drive ID or a local path) to file info.
+    
+    Returns: file_info dict or None
+    """
+    # Check if it looks like a Google Drive ID (alphanumeric, typically 25-44 chars)
+    if len(input_path) > 20 and '/' not in input_path and '\\' not in input_path and ' ' not in input_path:
+        # Likely a Drive ID
+        try:
+            return get_file_info(service, input_path)
+        except Exception:
+            pass
+    
+    # Check if it's a local path that exists
+    local_path = Path(input_path)
+    if local_path.exists():
+        print(f"  → Local file detected, searching in Google Drive...")
+        file_info = find_drive_id_by_path(service, input_path)
+        if file_info:
+            print(f"  → Found Drive ID: {file_info['id']}")
+            return file_info
+        else:
+            print(f"  → Could not find corresponding file in Google Drive")
+            return None
+    
+    # Try as Drive ID anyway
+    try:
+        return get_file_info(service, input_path)
+    except Exception as e:
+        print(f"  → Not found as Drive ID either: {e}")
+        return None
+
+
+def authenticate():
+    """Authenticate with Google Drive API and return service object."""
+    creds = None
+    token_path = Path('token.json')
+    credentials_path = Path('credentials.json')
+    
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
+    
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not credentials_path.exists():
+                print("Error: 'credentials.json' not found.")
+                print("\nTo set up Google Drive API credentials:")
+                print("1. Go to https://console.cloud.google.com/")
+                print("2. Create or select a project")
+                print("3. Enable the Google Drive API")
+                print("4. Go to Credentials → Create Credentials → OAuth client ID")
+                print("5. Select 'Desktop application'")
+                print("6. Download the JSON and save as 'credentials.json'")
+                sys.exit(1)
+            
+            flow = InstalledAppFlow.from_client_secrets_file(str(credentials_path), SCOPES)
+            creds = flow.run_local_server(port=0)
+        
+        token_path.write_text(creds.to_json())
+    
+    return build('drive', 'v3', credentials=creds)
+
+
+def get_file_info(service, file_id):
+    """Get file metadata."""
+    return service.files().get(
+        fileId=file_id,
+        fields='id, name, mimeType, parents'
+    ).execute()
+
+
+def is_folder(service, item_id):
+    """Check if the given ID is a folder."""
+    try:
+        info = get_file_info(service, item_id)
+        return info.get('mimeType') == 'application/vnd.google-apps.folder'
+    except Exception:
+        return False
+
+
+def list_docx_files_in_folder(service, folder_id, recursive=True):
+    """List all .docx files in a folder (optionally recursive)."""
+    docx_files = []
+    
+    # Query for Word documents and Google Docs in this folder
+    query = f"'{folder_id}' in parents and trashed = false"
+    
+    results = service.files().list(
+        q=query,
+        fields='files(id, name, mimeType)',
+        pageSize=1000
+    ).execute()
+    
+    for item in results.get('files', []):
+        mime = item.get('mimeType', '')
+        name = item.get('name', '')
+        
+        # Match .docx files (uploaded) and Google Docs (native)
+        if mime == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+            docx_files.append(item)
+        elif mime == 'application/vnd.google-apps.document':
+            # Native Google Doc - can be exported as docx
+            item['is_google_doc'] = True
+            docx_files.append(item)
+        elif mime == 'application/vnd.google-apps.folder' and recursive:
+            # Recurse into subfolders
+            docx_files.extend(list_docx_files_in_folder(service, item['id'], recursive))
+    
+    return docx_files
+
+
+def get_revisions(service, file_id):
+    """Get all revisions for a file, sorted by modified time."""
+    try:
+        rev_list = []
+        page_token = None
+        
+        while True:
+            revisions = service.revisions().list(
+                fileId=file_id,
+                fields='nextPageToken, revisions(id, modifiedTime, originalFilename, keepForever)',
+                pageSize=1000,
+                pageToken=page_token
+            ).execute()
+            
+            rev_list.extend(revisions.get('revisions', []))
+            page_token = revisions.get('nextPageToken')
+            
+            if not page_token:
+                break
+        
+        # Sort by modified time
+        rev_list.sort(key=lambda r: r.get('modifiedTime', ''))
+        return rev_list
+    except Exception as e:
+        print(f"  Warning: Could not get revisions: {e}")
+        return []
+
+
+def download_revision(service, file_id, revision_id, is_google_doc=False):
+    """Download a specific revision of a file."""
+    try:
+        if is_google_doc:
+            # For Google Docs, export as docx
+            request = service.revisions().get_media(
+                fileId=file_id,
+                revisionId=revision_id
+            )
+            # Google Docs revisions need to be exported
+            # Actually, for native Google Docs, we need to use export
+            request = service.files().export_media(
+                fileId=file_id,
+                mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            )
+        else:
+            # For uploaded .docx files
+            request = service.revisions().get_media(
+                fileId=file_id,
+                revisionId=revision_id
+            )
+        
+        buffer = io.BytesIO()
+        downloader = MediaIoBaseDownload(buffer, request)
+        
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        
+        buffer.seek(0)
+        return buffer
+    except Exception as e:
+        print(f"  Warning: Could not download revision {revision_id}: {e}")
+        return None
+
+
+def download_current_version(service, file_id, is_google_doc=False):
+    """Download the current version of a file."""
+    try:
+        if is_google_doc:
+            request = service.files().export_media(
+                fileId=file_id,
+                mimeType='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            )
+        else:
+            request = service.files().get_media(fileId=file_id)
+        
+        buffer = io.BytesIO()
+        downloader = MediaIoBaseDownload(buffer, request)
+        
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        
+        buffer.seek(0)
+        return buffer
+    except Exception as e:
+        print(f"  Warning: Could not download current version: {e}")
+        return None
+
+
+def extract_text_from_docx(docx_buffer, include_styles=None, exclude_styles=None, include_empty=False):
+    """Extract plain text from a docx file buffer using python-docx.
+    
+    Args:
+        docx_buffer: File buffer containing the docx content
+        include_styles: If set, only include paragraphs with these style names (whitelist)
+        exclude_styles: If set, exclude paragraphs with these style names (blacklist)
+        include_empty: If False (default), skip empty paragraphs
+    """
+    try:
+        from docx import Document
+        doc = Document(docx_buffer)
+        
+        paragraphs = []
+        for para in doc.paragraphs:
+            style_name = para.style.name if para.style else None
+            
+            # Apply whitelist filter
+            if include_styles is not None:
+                if style_name not in include_styles:
+                    continue
+            
+            # Apply blacklist filter
+            if exclude_styles is not None:
+                if style_name in exclude_styles:
+                    continue
+            
+            # Skip empty paragraphs unless explicitly included
+            if not include_empty and not para.text.strip():
+                continue
+            
+            paragraphs.append(para.text)
+        
+        # Also extract text from tables (no style filtering for tables)
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = []
+                for cell in row.cells:
+                    row_text.append(cell.text)
+                paragraphs.append(' | '.join(row_text))
+        
+        return '\n'.join(paragraphs)
+    except Exception as e:
+        print(f"  Warning: Could not extract text: {e}")
+        return ""
+
+
+def extract_text_with_pandoc(docx_buffer, include_styles=None, exclude_styles=None, include_empty=False):
+    """Extract text from docx using pandoc (better formatting preservation).
+    
+    Note: If style filters are specified, falls back to python-docx since
+    pandoc doesn't preserve Word paragraph style information.
+    """
+    # If style filtering is requested, must use python-docx
+    if include_styles is not None or exclude_styles is not None:
+        return extract_text_from_docx(docx_buffer, include_styles, exclude_styles, include_empty)
+    
+    try:
+        import subprocess
+        
+        # Write buffer to temp file
+        with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
+            tmp.write(docx_buffer.read())
+            tmp_path = tmp.name
+        
+        docx_buffer.seek(0)  # Reset buffer position
+        
+        # Convert to markdown using pandoc
+        result = subprocess.run(
+            ['pandoc', tmp_path, '-t', 'plain', '--wrap=none'],
+            capture_output=True,
+            text=True
+        )
+        
+        os.unlink(tmp_path)
+        
+        if result.returncode == 0:
+            return result.stdout
+        else:
+            # Fall back to python-docx
+            return extract_text_from_docx(docx_buffer, include_empty=include_empty)
+    except FileNotFoundError:
+        # pandoc not installed, use python-docx
+        return extract_text_from_docx(docx_buffer, include_empty=include_empty)
+    except Exception:
+        return extract_text_from_docx(docx_buffer, include_empty=include_empty)
+
+
+def generate_html_diff(text1, text2, filename, rev1_info, rev2_info):
+    """Generate an HTML diff between two text versions."""
+    lines1 = text1.splitlines(keepends=True)
+    lines2 = text2.splitlines(keepends=True)
+    
+    differ = difflib.HtmlDiff(wrapcolumn=80)
+    
+    # Format revision info
+    from_desc = f"First version ({rev1_info.get('modifiedTime', 'unknown')[:10]})"
+    to_desc = f"Last version ({rev2_info.get('modifiedTime', 'unknown')[:10]})"
+    
+    html_diff = differ.make_file(
+        lines1, lines2,
+        fromdesc=from_desc,
+        todesc=to_desc,
+        context=True,
+        numlines=3
+    )
+    
+    # Add custom styling for better readability
+    custom_css = """
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 20px; }
+        h1 { color: #333; border-bottom: 2px solid #4a90d9; padding-bottom: 10px; }
+        .diff { border-collapse: collapse; width: 100%; }
+        .diff td { padding: 4px 8px; font-family: 'SF Mono', Monaco, 'Courier New', monospace; font-size: 13px; }
+        .diff_header { background-color: #f0f0f0; font-weight: bold; }
+        .diff_next { background-color: #f8f8f8; }
+        .diff_add { background-color: #e6ffed; }
+        .diff_chg { background-color: #fffbe6; }
+        .diff_sub { background-color: #ffeef0; }
+        td.diff_header { text-align: right; padding-right: 10px; }
+        .summary { background: #f5f5f5; padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+        .legend { margin: 20px 0; }
+        .legend span { padding: 3px 10px; margin-right: 15px; border-radius: 3px; }
+        .legend .added { background-color: #e6ffed; }
+        .legend .changed { background-color: #fffbe6; }
+        .legend .removed { background-color: #ffeef0; }
+    </style>
+    """
+    
+    # Add header with file info
+    header = f"""
+    <h1>Document Comparison: {html.escape(filename)}</h1>
+    <div class="summary">
+        <p><strong>File:</strong> {html.escape(filename)}</p>
+        <p><strong>First Version:</strong> {html.escape(rev1_info.get('modifiedTime', 'unknown'))}</p>
+        <p><strong>Last Version:</strong> {html.escape(rev2_info.get('modifiedTime', 'unknown'))}</p>
+        <p><strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+    </div>
+    <div class="legend">
+        <span class="added">Added</span>
+        <span class="changed">Changed</span>
+        <span class="removed">Removed</span>
+    </div>
+    """
+    
+    # Insert custom CSS and header
+    html_diff = html_diff.replace('</head>', custom_css + '</head>')
+    html_diff = html_diff.replace('<body>', '<body>' + header)
+    
+    return html_diff
+
+
+def word_diff_line(old_line, new_line):
+    """Generate word-level diff HTML for a pair of lines."""
+    import re
+    
+    # Split into words while preserving whitespace
+    def tokenize(s):
+        return re.findall(r'\S+|\s+', s)
+    
+    old_words = tokenize(old_line)
+    new_words = tokenize(new_line)
+    
+    matcher = difflib.SequenceMatcher(None, old_words, new_words)
+    
+    old_html = []
+    new_html = []
+    
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        if op == 'equal':
+            old_html.append(html.escape(''.join(old_words[i1:i2])))
+            new_html.append(html.escape(''.join(new_words[j1:j2])))
+        elif op == 'replace':
+            old_html.append(f'<span class="word-del">{html.escape("".join(old_words[i1:i2]))}</span>')
+            new_html.append(f'<span class="word-add">{html.escape("".join(new_words[j1:j2]))}</span>')
+        elif op == 'delete':
+            old_html.append(f'<span class="word-del">{html.escape("".join(old_words[i1:i2]))}</span>')
+        elif op == 'insert':
+            new_html.append(f'<span class="word-add">{html.escape("".join(new_words[j1:j2]))}</span>')
+    
+    return ''.join(old_html), ''.join(new_html)
+
+
+def generate_unified_diff_html(text1, text2, filename, rev1_info, rev2_info):
+    """Generate a cleaner unified diff in HTML format with word-level highlighting."""
+    lines1 = text1.splitlines()
+    lines2 = text2.splitlines()
+    
+    diff = list(difflib.unified_diff(
+        lines1, lines2,
+        fromfile=f"First version ({rev1_info.get('modifiedTime', 'unknown')[:10]})",
+        tofile=f"Last version ({rev2_info.get('modifiedTime', 'unknown')[:10]})",
+        lineterm=''
+    ))
+    
+    # Build HTML
+    html_parts = [f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Diff: {html.escape(filename)}</title>
+    <style>
+        body {{ 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+            margin: 20px; 
+            background: #fafafa;
+            overflow-x: auto;
+        }}
+        h1 {{ color: #333; border-bottom: 2px solid #4a90d9; padding-bottom: 10px; }}
+        .summary {{ background: #fff; padding: 15px; border-radius: 5px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+        .diff-container {{ 
+            width: fit-content;
+            background: #fff; 
+            border-radius: 5px; 
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        pre {{ 
+            margin: 0; 
+            padding: 15px; 
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace; 
+            font-size: 13px; 
+            line-height: 1.5;
+            white-space: pre;
+        }}
+        .diff-group {{
+            position: relative;
+            border-bottom: 1px solid #eee;
+            padding: 4px 0;
+            cursor: pointer;
+        }}
+        .diff-group:last-child {{
+            border-bottom: none;
+        }}
+        .diff-group:hover {{
+            background-color: rgba(0,0,0,0.02);
+            outline: 2px solid #dc3545;
+            outline-offset: -2px;
+        }}
+        .line {{ display: block; padding: 2px 10px; }}
+        .line-add {{ background-color: #e6ffed; color: #22863a; }}
+        .line-del {{ background-color: #ffeef0; color: #cb2431; }}
+        .line-info {{ background-color: #f1f8ff; color: #0366d6; }}
+        .line-context {{ color: #24292e; }}
+        .no-changes {{ padding: 20px; text-align: center; color: #666; }}
+        .legend {{ margin: 20px 0; }}
+        .legend span {{ padding: 3px 10px; margin-right: 15px; border-radius: 3px; font-size: 14px; }}
+        .legend .added {{ background-color: #e6ffed; color: #22863a; }}
+        .legend .removed {{ background-color: #ffeef0; color: #cb2431; }}
+        .stats {{ padding: 10px 15px; font-size: 14px; color: #666; border-top: 1px solid #eee; }}
+        .stats .additions {{ color: #22863a; }}
+        .stats .deletions {{ color: #cb2431; }}
+        .deleted-group {{
+            display: none !important;
+        }}
+        /* Word diff highlighting */
+        .word-add {{ background-color: #acf2bd; padding: 1px 2px; border-radius: 2px; }}
+        .word-del {{ background-color: #fdb8c0; padding: 1px 2px; border-radius: 2px; text-decoration: line-through; }}
+    </style>
+</head>
+<body>
+    <h1>Document Comparison: {html.escape(filename)}</h1>
+    <div class="summary">
+        <p><strong>File:</strong> {html.escape(filename)}</p>
+        <p><strong>First Version:</strong> {html.escape(rev1_info.get('modifiedTime', 'unknown'))}</p>
+        <p><strong>Last Version:</strong> {html.escape(rev2_info.get('modifiedTime', 'unknown'))}</p>
+        <p><strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+    </div>
+    <div class="legend">
+        <span class="added">+ Added</span>
+        <span class="removed">− Removed</span>
+    </div>
+    <div class="diff-container">
+        <pre>
+"""]
+    
+    if not diff:
+        html_parts.append('<div class="no-changes">No changes detected between versions</div>')
+    else:
+        additions = 0
+        deletions = 0
+        
+        # Group consecutive diff lines (+ or -) together
+        groups = []
+        current_group = []
+        current_type = None  # 'change', 'info', 'context'
+        
+        for line in diff:
+            if line.startswith('+++') or line.startswith('---') or line.startswith('@@'):
+                line_type = 'info'
+            elif line.startswith('+') or line.startswith('-'):
+                line_type = 'change'
+            else:
+                line_type = 'context'
+            
+            if line_type != current_type and current_group:
+                groups.append((current_type, current_group))
+                current_group = []
+            
+            current_group.append(line)
+            current_type = line_type
+        
+        if current_group:
+            groups.append((current_type, current_group))
+        
+        # First pass: assign group IDs to change groups
+        group_id = 0
+        group_indices = []  # Track which index in groups list is a change group
+        for i, (group_type, lines) in enumerate(groups):
+            if group_type == 'change':
+                group_indices.append((i, group_id))
+                group_id += 1
+        
+        total_groups = group_id
+        
+        # Second pass: generate HTML with context tracking
+        change_group_id = 0
+        for i, (group_type, lines) in enumerate(groups):
+            if group_type == 'change':
+                # Separate deletions and additions for word diff
+                del_lines = [l[1:] for l in lines if l.startswith('-')]
+                add_lines = [l[1:] for l in lines if l.startswith('+')]
+                
+                # Generate word-level diffs by pairing del/add lines
+                word_diff_pairs = []
+                max_pairs = max(len(del_lines), len(add_lines))
+                for idx in range(max_pairs):
+                    old_l = del_lines[idx] if idx < len(del_lines) else ''
+                    new_l = add_lines[idx] if idx < len(add_lines) else ''
+                    if old_l or new_l:
+                        old_html, new_html = word_diff_line(old_l, new_l)
+                        if old_l:
+                            word_diff_pairs.append(('del', old_html))
+                        if new_l:
+                            word_diff_pairs.append(('add', new_html))
+                
+                html_parts.append(f'<div class="diff-group" id="group-{change_group_id}" data-group-id="{change_group_id}">')
+                
+                # Word diff content
+                for diff_type, content in word_diff_pairs:
+                    if diff_type == 'del':
+                        html_parts.append(f'<span class="line line-del">-{content}</span>')
+                        deletions += 1
+                    else:
+                        html_parts.append(f'<span class="line line-add">+{content}</span>')
+                        additions += 1
+                
+                html_parts.append('</div>')
+                change_group_id += 1
+            else:
+                # Context/info lines - find adjacent change groups
+                adjacent_groups = []
+                # Look for previous change group
+                for j in range(i - 1, -1, -1):
+                    if groups[j][0] == 'change':
+                        # Find its group_id
+                        for idx, gid in group_indices:
+                            if idx == j:
+                                adjacent_groups.append(gid)
+                                break
+                        break
+                # Look for next change group
+                for j in range(i + 1, len(groups)):
+                    if groups[j][0] == 'change':
+                        # Find its group_id
+                        for idx, gid in group_indices:
+                            if idx == j:
+                                adjacent_groups.append(gid)
+                                break
+                        break
+                
+                # Wrap context in a div with data attribute listing adjacent groups
+                if adjacent_groups:
+                    adjacent_str = ','.join(str(g) for g in adjacent_groups)
+                    html_parts.append(f'<div class="context-group" data-adjacent="{adjacent_str}">')
+                
+                for line in lines:
+                    escaped = html.escape(line)
+                    if line.startswith('+++') or line.startswith('---') or line.startswith('@@'):
+                        html_parts.append(f'<span class="line line-info">{escaped}</span>')
+                    else:
+                        html_parts.append(f'<span class="line line-context">{escaped}</span>')
+                
+                if adjacent_groups:
+                    html_parts.append('</div>')
+        
+        html_parts.append('</pre>')
+        html_parts.append(f'<div class="stats"><span class="additions">+{additions} additions</span>, <span class="deletions">-{deletions} deletions</span></div>')
+    
+    html_parts.append("""
+    </div>
+    <script>
+        var deletedGroups = new Set();
+        
+        document.addEventListener('click', function(e) {
+            // Check for Ctrl (Windows/Linux) or Option/Alt (Mac)
+            if (e.altKey || e.ctrlKey) {
+                var group = e.target.closest('.diff-group');
+                if (group) {
+                    e.preventDefault();
+                    var id = parseInt(group.getAttribute('data-group-id'));
+                    group.classList.add('deleted-group');
+                    deletedGroups.add(id);
+                    updateContextVisibility();
+                }
+            }
+        });
+        
+        function updateContextVisibility() {
+            var contextGroups = document.querySelectorAll('.context-group');
+            contextGroups.forEach(function(ctx) {
+                var adjacent = ctx.getAttribute('data-adjacent').split(',').map(Number);
+                var allDeleted = adjacent.every(function(gid) {
+                    return deletedGroups.has(gid);
+                });
+                if (allDeleted) {
+                    ctx.classList.add('deleted-group');
+                }
+            });
+        }
+    </script>
+</body>
+</html>
+""")
+    
+    return ''.join(html_parts)
+
+
+def process_file(service, file_info, output_dir, diff_style='unified', after_dt=None, before_dt=None, include_styles=None, exclude_styles=None, include_empty=False):
+    """Process a single file: get versions and generate diff."""
+    file_id = file_info['id']
+    filename = file_info['name']
+    is_google_doc = file_info.get('is_google_doc', False)
+    
+    print(f"\nProcessing: {filename}")
+    
+    # Get revisions
+    revisions = get_revisions(service, file_id)
+    
+    if not revisions:
+        print(f"  Skipping: No revisions available")
+        return None
+    
+    # Debug: show date range of all revisions
+    if revisions:
+        first_date = revisions[0].get('modifiedTime', 'unknown')[:10]
+        last_date = revisions[-1].get('modifiedTime', 'unknown')[:10]
+        print(f"  All revisions span: {first_date} to {last_date}")
+        print(f"  All revision dates:")
+        for i, rev in enumerate(revisions):
+            kept = " [Keep Forever]" if rev.get('keepForever') else ""
+            print(f"    {i+1}. {rev.get('modifiedTime', 'unknown')}{kept}")
+    
+    # Filter revisions by date range
+    filtered_revisions = []
+    skipped_after = 0
+    skipped_before = 0
+    for rev in revisions:
+        rev_time_str = rev.get('modifiedTime', '')
+        if rev_time_str:
+            # Parse ISO format: 2024-01-15T10:30:00.000Z
+            rev_time = datetime.fromisoformat(rev_time_str.replace('Z', '+00:00')).replace(tzinfo=None)
+            
+            if after_dt and rev_time < after_dt:
+                skipped_after += 1
+                continue
+            if before_dt and rev_time > before_dt:
+                skipped_before += 1
+                continue
+            
+            filtered_revisions.append(rev)
+    
+    if after_dt or before_dt:
+        print(f"  Filtering: {skipped_after} before cutoff, {skipped_before} after cutoff, {len(filtered_revisions)} in range")
+    
+    if len(filtered_revisions) < 2:
+        date_info = []
+        if after_dt:
+            date_info.append(f"after {after_dt.strftime('%Y-%m-%d')}")
+        if before_dt:
+            date_info.append(f"before {before_dt.strftime('%Y-%m-%d')}")
+        date_str = " and ".join(date_info) if date_info else "in range"
+        print(f"  Skipping: Less than 2 revisions {date_str} (found {len(filtered_revisions)} of {len(revisions)} total)")
+        return None
+    
+    first_rev = filtered_revisions[0]
+    last_rev = filtered_revisions[-1]
+    
+    print(f"  Found {len(filtered_revisions)} revisions in date range (of {len(revisions)} total)")
+    print(f"  First: {first_rev.get('modifiedTime', 'unknown')}")
+    print(f"  Last:  {last_rev.get('modifiedTime', 'unknown')}")
+    
+    # Download both versions
+    print("  Downloading first version...")
+    first_buffer = download_revision(service, file_id, first_rev['id'], is_google_doc)
+    
+    print("  Downloading last version...")
+    last_buffer = download_revision(service, file_id, last_rev['id'], is_google_doc)
+    
+    if not first_buffer or not last_buffer:
+        print(f"  Error: Could not download revisions")
+        return None
+    
+    # Extract text
+    print("  Extracting text...")
+    first_text = extract_text_with_pandoc(first_buffer, include_styles, exclude_styles, include_empty)
+    last_text = extract_text_with_pandoc(last_buffer, include_styles, exclude_styles, include_empty)
+    
+    if not first_text and not last_text:
+        print(f"  Error: Could not extract text from documents")
+        return None
+    
+    # Generate diff
+    print("  Generating diff...")
+    
+    # Check if there are actual differences
+    if first_text.strip() == last_text.strip():
+        print(f"  Skipping: No differences between versions")
+        return None
+    
+    if diff_style == 'side-by-side':
+        html_diff = generate_html_diff(first_text, last_text, filename, first_rev, last_rev)
+    else:
+        html_diff = generate_unified_diff_html(first_text, last_text, filename, first_rev, last_rev)
+    
+    # Save diff file
+    safe_filename = "".join(c if c.isalnum() or c in '._- ' else '_' for c in filename)
+    safe_filename = safe_filename.replace('.docx', '').replace('.doc', '')
+    output_path = output_dir / f"{safe_filename}_diff.html"
+    
+    output_path.write_text(html_diff, encoding='utf-8')
+    
+    # Show full absolute path for easy clicking in terminal
+    full_path = output_path.resolve()
+    print(f"  ✓ Saved: file://{full_path}")
+    
+    return output_path
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Compare Google Drive Word document versions and generate HTML diffs',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    %(prog)s "Document.docx"                           # Local file from synced folder
+    %(prog)s "./Subfolder/"                            # Local folder (all .docx files)
+    %(prog)s 1ABC123def456                             # Google Drive file ID
+    %(prog)s --after 2024-01-01 ./folder/              # Changes since Jan 1, 2024
+    %(prog)s --before 2024-06-01 ./folder/             # Changes up to June 1, 2024
+    %(prog)s -a 2024-01-01 -b 2024-06-01 ./folder/     # Changes in first half of 2024
+    %(prog)s --style side-by-side doc.docx             # Use side-by-side diff view
+    %(prog)s -i "Verse Tibetan" "Verse Translation" ./  # Only diff these styles
+    %(prog)s -e "Normal" "Header" ./folder/             # Exclude these styles from diff
+        """
+    )
+    
+    parser.add_argument(
+        'ids',
+        nargs='+',
+        help='Local file/folder paths (from synced Drive) or Google Drive IDs'
+    )
+    
+    parser.add_argument(
+        '--output', '-o',
+        default='output_diffs',
+        help='Output directory for diff files (default: output_diffs)'
+    )
+    
+    parser.add_argument(
+        '--style', '-s',
+        choices=['unified', 'side-by-side'],
+        default='unified',
+        help='Diff display style (default: unified)'
+    )
+    
+    parser.add_argument(
+        '--after', '-a',
+        help='Only consider versions after this date/time (e.g., "2024-01-15" or "2024-01-15T10:30:00")'
+    )
+    
+    parser.add_argument(
+        '--before', '-b',
+        help='Only consider versions before this date/time (e.g., "2024-06-01" or "2024-06-01T18:00:00")'
+    )
+    
+    parser.add_argument(
+        '--no-recursive', '-nr',
+        action='store_true',
+        help='Do not process subfolders recursively'
+    )
+    
+    parser.add_argument(
+        '--include-styles', '-i',
+        nargs='+',
+        metavar='STYLE',
+        help='Only include paragraphs with these styles (whitelist). Style names are case-sensitive.'
+    )
+    
+    parser.add_argument(
+        '--exclude-styles', '-e',
+        nargs='+',
+        metavar='STYLE',
+        help='Exclude paragraphs with these styles (blacklist). Style names are case-sensitive.'
+    )
+    
+    parser.add_argument(
+        '--include-empty',
+        action='store_true',
+        help='Include empty paragraphs in the diff (excluded by default)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Parse date filters
+    after_dt = parse_datetime(args.after) if args.after else None
+    before_dt = parse_datetime(args.before) if args.before else None
+    
+    # Parse style filters
+    include_styles = set(args.include_styles) if args.include_styles else None
+    exclude_styles = set(args.exclude_styles) if args.exclude_styles else None
+    
+    if include_styles and exclude_styles:
+        print("Warning: Both --include-styles and --exclude-styles specified. Include takes precedence.")
+        exclude_styles = None
+    
+    # Create output directory
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print("Google Drive Document Version Diff Generator")
+    print("=" * 50)
+    
+    if after_dt or before_dt:
+        date_range = []
+        if after_dt:
+            date_range.append(f"after {after_dt.strftime('%Y-%m-%d %H:%M')}")
+        if before_dt:
+            date_range.append(f"before {before_dt.strftime('%Y-%m-%d %H:%M')}")
+        print(f"Date filter: {' and '.join(date_range)}")
+    
+    if include_styles:
+        print(f"Style whitelist: {', '.join(sorted(include_styles))}")
+    if exclude_styles:
+        print(f"Style blacklist: {', '.join(sorted(exclude_styles))}")
+    
+    # Authenticate
+    print("\nAuthenticating with Google Drive...")
+    service = authenticate()
+    print("✓ Authenticated successfully")
+    
+    # Collect all files to process
+    files_to_process = []
+    
+    for item_path in args.ids:
+        print(f"\nChecking: {item_path}")
+        
+        # First, resolve the input (local path or Drive ID) to file info
+        file_info = resolve_input_to_file_info(service, item_path)
+        
+        if not file_info:
+            print(f"  → Could not resolve: {item_path}")
+            continue
+        
+        # Check if it's a folder
+        if file_info.get('mimeType') == 'application/vnd.google-apps.folder':
+            print("  → Folder detected, listing .docx files...")
+            folder_files = list_docx_files_in_folder(
+                service, file_info['id'], 
+                recursive=not args.no_recursive
+            )
+            print(f"  → Found {len(folder_files)} document(s)")
+            files_to_process.extend(folder_files)
+        else:
+            files_to_process.append(file_info)
+    
+    if not files_to_process:
+        print("\nNo documents found to process.")
+        return
+    
+    print(f"\n{'=' * 50}")
+    print(f"Processing {len(files_to_process)} document(s)...")
+    print(f"{'=' * 50}")
+    
+    # Process each file
+    results = []
+    for file_info in files_to_process:
+        result = process_file(service, file_info, output_dir, args.style, after_dt, before_dt, include_styles, exclude_styles, args.include_empty)
+        if result:
+            results.append(result)
+    
+    # Summary
+    print(f"\n{'=' * 50}")
+    print(f"SUMMARY")
+    print(f"{'=' * 50}")
+    print(f"Documents processed: {len(files_to_process)}")
+    print(f"Diffs generated: {len(results)}")
+    print(f"Output directory: {output_dir.absolute()}")
+    
+    if results:
+        print("\nGenerated files:")
+        for path in results:
+            print(f"  • {path.name}")
+
+
+if __name__ == '__main__':
+    main()

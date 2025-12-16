@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""
+Update paragraph styles in Word documents.
+Processes .docx files passed as arguments or found in folders passed as arguments.
+"""
+
+import sys
+import os
+from pathlib import Path
+from docx import Document
+from docx.shared import Pt, Cm, RGBColor
+from docx.enum.text import WD_LINE_SPACING
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
+
+def set_font_name(run_or_font, font_name):
+    """Set font name including for complex scripts (Tibetan)."""
+    run_or_font.name = font_name
+    # For complex scripts like Tibetan
+    r = run_or_font._element
+    rPr = r.get_or_add_rPr() if hasattr(r, 'get_or_add_rPr') else r
+    rFonts = rPr.find(qn('w:rFonts'))
+    if rFonts is None:
+        rFonts = OxmlElement('w:rFonts')
+        rPr.insert(0, rFonts)
+    rFonts.set(qn('w:ascii'), font_name)
+    rFonts.set(qn('w:hAnsi'), font_name)
+    rFonts.set(qn('w:cs'), font_name)
+    rFonts.set(qn('w:eastAsia'), font_name)
+
+
+def set_style_font(style, font_name, size_pt, color=None, bold=None, italic=None, small_caps=None):
+    """Set font properties on a style."""
+    font = style.font
+    font.name = font_name
+    font.size = Pt(size_pt)
+    
+    # Set font for complex scripts
+    rPr = style.element.get_or_add_rPr()
+    rFonts = rPr.find(qn('w:rFonts'))
+    if rFonts is None:
+        rFonts = OxmlElement('w:rFonts')
+        rPr.insert(0, rFonts)
+    rFonts.set(qn('w:ascii'), font_name)
+    rFonts.set(qn('w:hAnsi'), font_name)
+    rFonts.set(qn('w:cs'), font_name)
+    rFonts.set(qn('w:eastAsia'), font_name)
+    
+    # Set size for complex scripts
+    szCs = rPr.find(qn('w:szCs'))
+    if szCs is None:
+        szCs = OxmlElement('w:szCs')
+        rPr.append(szCs)
+    szCs.set(qn('w:val'), str(int(size_pt * 2)))  # Size in half-points
+    
+    if color:
+        font.color.rgb = color
+    if bold is not None:
+        font.bold = bold
+    if italic is not None:
+        font.italic = italic
+    if small_caps is not None:
+        font.small_caps = small_caps
+
+
+def set_style_paragraph(style, line_spacing_single=False, space_before_pt=None, space_after_pt=None, left_indent_cm=None):
+    """Set paragraph formatting on a style."""
+    pf = style.paragraph_format
+    
+    if line_spacing_single:
+        pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+    
+    if space_before_pt is not None:
+        pf.space_before = Pt(space_before_pt)
+    
+    if space_after_pt is not None:
+        pf.space_after = Pt(space_after_pt)
+    
+    if left_indent_cm is not None:
+        pf.left_indent = Cm(left_indent_cm)
+
+
+def update_styles(doc):
+    """Update paragraph styles in the document."""
+    styles = doc.styles
+    
+    # Define style configurations
+    style_configs = {
+        'Short Title Tibetan': {
+            'font': 'TibetanChogyalUnicode-170221',
+            'size': 22,
+            'color': RGBColor(0, 0, 255),
+            'line_single': True,
+        },
+        'Short Title Translation': {
+            'font': 'Times New Roman',
+            'size': 14,
+            'color': RGBColor(0, 0, 255),
+            'line_single': True,
+            'space_after': 16,
+        },
+        'Heading 1 Tibetan': {
+            'font': 'TibetanChogyalUnicode-170221',
+            'size': 22,
+            'line_single': True,
+        },
+        'Verse Tibetan': {
+            'font': 'TibetanChogyalUnicode-170221',
+            'size': 22,
+            'line_single': True,
+        },
+        'Yigchung Tibetan': {
+            'font': 'TibetanChogyalUnicode-170221',
+            'size': 18,
+            'line_single': True,
+        },
+        'Heading 1 Translation': {
+            'font': 'Times New Roman',
+            'size': 12,
+            'small_caps': True,
+            'line_single': True,
+            'space_after': 2.8,
+        },
+        'Heading 2 Translation': {
+            'font': 'Times New Roman',
+            'size': 10,
+            'bold': True,
+            'italic': True,
+            'line_single': True,
+            'space_before': 2.8,
+            'space_after': 8.5,
+        },
+        'Verse Phonetics': {
+            'font': 'Arial',
+            'size': 9.5,
+            'line_single': True,
+            'left_indent': 0.2,
+        },
+        'Verse Translation': {
+            'font': 'Times New Roman',
+            'size': 9.5,
+            'line_single': True,
+            'left_indent': 0.2,
+        },
+        'Yigchung Translation': {
+            'font': 'Times New Roman',
+            'size': 9,
+            'italic': True,
+            'line_single': True,
+            'left_indent': 0.2,
+            'space_before': 5.65,
+            'space_after': 5.65,
+        },
+    }
+    
+    updated_styles = []
+    missing_styles = []
+    
+    for style_name, config in style_configs.items():
+        try:
+            style = styles[style_name]
+            
+            # Set font properties
+            set_style_font(
+                style,
+                font_name=config['font'],
+                size_pt=config['size'],
+                color=config.get('color'),
+                bold=config.get('bold'),
+                italic=config.get('italic'),
+                small_caps=config.get('small_caps'),
+            )
+            
+            # Set paragraph properties
+            set_style_paragraph(
+                style,
+                line_spacing_single=config.get('line_single', False),
+                space_before_pt=config.get('space_before'),
+                space_after_pt=config.get('space_after'),
+                left_indent_cm=config.get('left_indent'),
+            )
+            
+            updated_styles.append(style_name)
+        except KeyError:
+            missing_styles.append(style_name)
+    
+    return updated_styles, missing_styles
+
+
+def find_docx_files(paths):
+    """Find all .docx files from given paths (files or directories)."""
+    docx_files = []
+    
+    for path_str in paths:
+        path = Path(path_str)
+        
+        if path.is_file() and path.suffix.lower() == '.docx':
+            docx_files.append(path)
+        elif path.is_dir():
+            docx_files.extend(path.rglob('*.docx'))
+        else:
+            print(f"Warning: '{path}' is not a valid file or directory")
+    
+    # Filter out temporary Word files (start with ~$)
+    docx_files = [f for f in docx_files if not f.name.startswith('~$')]
+    
+    return docx_files
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python update_word_styles.py <file_or_folder> [file_or_folder ...]")
+        print("  Processes .docx files passed as arguments or found in folders.")
+        sys.exit(1)
+    
+    paths = sys.argv[1:]
+    docx_files = find_docx_files(paths)
+    
+    if not docx_files:
+        print("No .docx files found.")
+        sys.exit(1)
+    
+    print(f"Found {len(docx_files)} Word document(s) to process.\n")
+    
+    for docx_path in docx_files:
+        print(f"Processing: {docx_path}")
+        
+        try:
+            doc = Document(docx_path)
+            updated, missing = update_styles(doc)
+            
+            if updated:
+                print(f"  Updated styles: {', '.join(updated)}")
+            if missing:
+                print(f"  Missing styles (skipped): {', '.join(missing)}")
+            
+            doc.save(docx_path)
+            print(f"  Saved: {docx_path}\n")
+            
+        except Exception as e:
+            print(f"  Error: {e}\n")
+
+
+if __name__ == '__main__':
+    main()
