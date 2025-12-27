@@ -13,6 +13,9 @@ def parse_srt(file_path):
         content = file.read()
     
     # Pattern to match subtitle entries
+    # Ensure content ends with newline so last entry is matched
+    if not content.endswith('\n'):
+        content += '\n'
     pattern = r'(\d+)\n(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})\n((?:.+\n)+)'
     matches = re.findall(pattern, content)
     

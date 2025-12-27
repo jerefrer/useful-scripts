@@ -45,10 +45,15 @@ def convert_xlsx_to_dfxp(xlsx_file, dfxp_template, output_dfxp):
         # Extract headers and find column indices
         headers = [cell.value for cell in ws[1]]
         
+        # ID column is optional - if not found, we'll auto-generate IDs
+        id_col = None
         try:
             id_col = headers.index('ID') + 1
         except ValueError:
-            id_col = headers.index('id') + 1
+            try:
+                id_col = headers.index('id') + 1
+            except ValueError:
+                pass  # No ID column, will auto-generate
         
         try:
             begin_col = headers.index('Begin') + 1
@@ -60,10 +65,15 @@ def convert_xlsx_to_dfxp(xlsx_file, dfxp_template, output_dfxp):
         except ValueError:
             end_col = headers.index('end') + 1
         
+        # Region column is optional - if not found, we'll use 'default'
+        region_col = None
         try:
             region_col = headers.index('Region') + 1
         except ValueError:
-            region_col = headers.index('region') + 1
+            try:
+                region_col = headers.index('region') + 1
+            except ValueError:
+                pass  # No Region column, will use 'default'
         
         try:
             original_col = headers.index('Original') + 1
@@ -78,12 +88,26 @@ def convert_xlsx_to_dfxp(xlsx_file, dfxp_template, output_dfxp):
         # Load subtitles from Excel
         subtitles = []
         for row in range(2, ws.max_row + 1):
-            subtitle_id = ws.cell(row=row, column=id_col).value
+            subtitle_id = ws.cell(row=row, column=id_col).value if id_col else None
             begin_time = ws.cell(row=row, column=begin_col).value
             end_time = ws.cell(row=row, column=end_col).value
-            region = ws.cell(row=row, column=region_col).value
+            region = ws.cell(row=row, column=region_col).value if region_col else None
             original_text = ws.cell(row=row, column=original_col).value
             translation_text = ws.cell(row=row, column=translation_col).value
+            
+            # Check if this is a continuation row (no start/end times but has content)
+            # In that case, append to the previous subtitle's text
+            if is_empty(begin_time) and is_empty(end_time) and subtitles:
+                # This is a continuation of the previous subtitle
+                if not is_empty(original_text):
+                    prev_original = subtitles[-1].get('original_text', '')
+                    subtitles[-1]['original_text'] = (prev_original + '\n' + str(original_text)) if prev_original else str(original_text)
+                if not is_empty(translation_text):
+                    prev_translation = subtitles[-1].get('translation_text', '')
+                    subtitles[-1]['translation_text'] = (prev_translation + '\n' + str(translation_text)) if prev_translation else str(translation_text)
+                # Update the text field based on updated original/translation
+                subtitles[-1]['text'] = subtitles[-1].get('translation_text') if not is_empty(subtitles[-1].get('translation_text')) else subtitles[-1].get('original_text', '')
+                continue
             
             # Use translation if available, otherwise use original
             text = translation_text if not is_empty(translation_text) else original_text
@@ -92,12 +116,18 @@ def convert_xlsx_to_dfxp(xlsx_file, dfxp_template, output_dfxp):
             if is_empty(text):
                 continue
                 
+            # Auto-generate ID if not provided
+            if subtitle_id is None:
+                subtitle_id = len(subtitles) + 1
+            
             subtitles.append({
                 'id': subtitle_id,
                 'begin': begin_time,
                 'end': end_time,
-                'region': region,
-                'text': text
+                'region': region if not is_empty(region) else 'default',
+                'text': text,
+                'original_text': str(original_text) if not is_empty(original_text) else '',
+                'translation_text': str(translation_text) if not is_empty(translation_text) else ''
             })
         
         # Check if we have subtitles to process

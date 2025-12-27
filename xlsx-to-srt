@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+
+import argparse
+import re
+from datetime import datetime, time
+
+import pandas as pd
+
+
+def _normalize_timestamp(value: object) -> str:
+    if value is None:
+        raise ValueError("Timestamp is missing")
+
+    if isinstance(value, datetime):
+        value = value.time()
+
+    if isinstance(value, time):
+        return f"{value.hour:02d}:{value.minute:02d}:{value.second:02d},{int(value.microsecond / 1000):03d}"
+
+    s = str(value).strip()
+    if not s:
+        raise ValueError("Timestamp is empty")
+
+    s = s.replace('.', ',')
+
+    m = re.fullmatch(r"(\d{2}):(\d{2}):(\d{2}),(\d{1,6})", s)
+    if not m:
+        raise ValueError(f"Invalid timestamp format: {value!r}")
+
+    hh, mm, ss, frac = m.groups()
+    ms = (frac + "000")[:3]
+    return f"{hh}:{mm}:{ss},{ms}"
+
+
+def convert_excel_to_srt(excel_file: str, srt_file: str) -> None:
+    df = pd.read_excel(excel_file)
+
+    required_cols = {"Number", "Begin", "End", "Text"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
+
+    df = df[list(required_cols)]
+
+    if df["Number"].notna().any():
+        df = df.sort_values(by=["Number"], kind="stable")
+
+    entries = []
+    for _, row in df.iterrows():
+        begin = row.get("Begin")
+        end = row.get("End")
+        text = row.get("Text")
+
+        if pd.isna(begin) and pd.isna(end) and pd.isna(text):
+            continue
+
+        if pd.isna(begin) or pd.isna(end) or pd.isna(text):
+            raise ValueError(f"Row has missing fields (Begin/End/Text): {row.to_dict()}")
+
+        begin_s = _normalize_timestamp(begin)
+        end_s = _normalize_timestamp(end)
+
+        text_s = str(text)
+        text_s = text_s.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+        if not text_s:
+            raise ValueError(f"Row has empty Text after trimming: {row.to_dict()}")
+
+        entries.append((begin_s, end_s, text_s))
+
+    with open(srt_file, "w", encoding="utf-8") as f:
+        for i, (begin_s, end_s, text_s) in enumerate(entries, start=1):
+            f.write(f"{i}\n")
+            f.write(f"{begin_s} --> {end_s}\n")
+            f.write(f"{text_s}\n\n")
+
+    print(f"Conversion complete! SRT file saved to {srt_file}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Convert Excel file to SRT")
+    parser.add_argument("excel_file", help="Path to the Excel (.xlsx) file")
+    parser.add_argument(
+        "--output",
+        "-o",
+        default=None,
+        help="Output SRT file path (default: input filename with .srt extension)",
+    )
+
+    args = parser.parse_args()
+
+    if args.output is None:
+        args.output = args.excel_file.rsplit(".", 1)[0] + ".srt"
+
+    convert_excel_to_srt(args.excel_file, args.output)
