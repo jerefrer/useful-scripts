@@ -1,3 +1,6 @@
 rich
 mutagen
 ffmpeg-python
+pycaption
+opencv-python
+pymupdf

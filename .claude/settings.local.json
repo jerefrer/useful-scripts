@@ -8,7 +8,10 @@
       "Bash(chmod:*)",
       "Bash(ulimit -n:*)",
       "Bash(python kbvs-cli.py:*)",
-      "Bash(python /Users/jeremy/Documents/Programming/useful-scripts/kburns-slideshow/kbvs-cli.py:*)"
+      "Bash(python /Users/jeremy/Documents/Programming/useful-scripts/kburns-slideshow/kbvs-cli.py:*)",
+      "mcp__serena__list_dir",
+      "Bash(/Users/jeremy/Documents/Programming/useful-scripts/srt-to-vtt:*)",
+      "Bash(cat:*)"
     ],
     "deny": [],
     "ask": []
