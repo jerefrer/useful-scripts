@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""
+srt-to-vtt - Convert SRT subtitle files to VTT format.
+Usage: srt-to-vtt input.srt [-o output.vtt]
+"""
+
+import argparse
+import sys
+import os
+import re
+
+
+def parse_srt(content):
+    """
+    Parse SRT content into structured cues.
+
+    Returns:
+        list of dicts with 'start', 'end', 'text' keys
+    """
+    # Normalize line endings
+    content = content.replace('\r\n', '\n').replace('\r', '\n')
+
+    # Split into blocks (separated by blank lines)
+    blocks = re.split(r'\n\n+', content.strip())
+
+    cues = []
+    # Pattern for SRT timestamp line: 00:00:00,000 --> 00:00:00,000
+    timestamp_pattern = re.compile(
+        r'(\d{1,2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,\.]\d{3})'
+    )
+
+    for block in blocks:
+        lines = block.strip().split('\n')
+        if len(lines) < 2:
+            continue
+
+        # Find timestamp line (could be first or second line)
+        timestamp_line = None
+        text_start = 0
+
+        for i, line in enumerate(lines):
+            match = timestamp_pattern.match(line.strip())
+            if match:
+                timestamp_line = match
+                text_start = i + 1
+                break
+
+        if not timestamp_line:
+            continue
+
+        start = timestamp_line.group(1)
+        end = timestamp_line.group(2)
+        text = '\n'.join(lines[text_start:]).strip()
+
+        if text:
+            cues.append({
+                'start': start,
+                'end': end,
+                'text': text
+            })
+
+    return cues
+
+
+def format_vtt_timestamp(timestamp):
+    """
+    Convert SRT timestamp to VTT format.
+    SRT: 00:00:00,000 (comma)
+    VTT: 00:00:00.000 (period)
+    Also ensures HH:MM:SS.mmm format.
+    """
+    # Replace comma with period
+    timestamp = timestamp.replace(',', '.')
+
+    # Ensure proper format HH:MM:SS.mmm
+    parts = timestamp.split(':')
+    if len(parts) == 3:
+        hours = parts[0].zfill(2)
+        minutes = parts[1].zfill(2)
+        seconds_ms = parts[2]
+        return f"{hours}:{minutes}:{seconds_ms}"
+
+    return timestamp
+
+
+def convert_srt_to_vtt(input_file, output_file, verbose=False):
+    """
+    Convert an SRT file to VTT format.
+
+    Args:
+        input_file (str): Path to input SRT file
+        output_file (str): Path to output VTT file
+        verbose (bool): Print detailed progress information
+
+    Returns:
+        bool: True if conversion succeeds, False otherwise
+    """
+    try:
+        if verbose:
+            print(f"Reading SRT file: {input_file}")
+
+        with open(input_file, 'r', encoding='utf-8-sig') as f_in:
+            srt_content = f_in.read()
+
+        if verbose:
+            print("Parsing SRT content...")
+
+        cues = parse_srt(srt_content)
+
+        if not cues:
+            print("Error: No valid subtitle cues found in file.")
+            return False
+
+        if verbose:
+            print(f"Found {len(cues)} subtitle cues")
+            print("Converting to VTT format...")
+
+        # Build VTT content
+        vtt_lines = ['WEBVTT', '']  # Header + blank line
+
+        for i, cue in enumerate(cues, 1):
+            start = format_vtt_timestamp(cue['start'])
+            end = format_vtt_timestamp(cue['end'])
+
+            vtt_lines.append(str(i))  # Cue identifier (optional but good practice)
+            vtt_lines.append(f"{start} --> {end}")
+            vtt_lines.append(cue['text'])
+            vtt_lines.append('')  # Blank line between cues
+
+        vtt_content = '\n'.join(vtt_lines)
+
+        if verbose:
+            print(f"Writing VTT file: {output_file}")
+
+        with open(output_file, 'w', encoding='utf-8') as f_out:
+            f_out.write(vtt_content)
+
+        if verbose:
+            print("Conversion successful!")
+
+        return True
+
+    except Exception as e:
+        print(f"Error during conversion: {e}")
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Convert SRT subtitle files to VTT format.'
+    )
+    parser.add_argument('input', help='Path to input SRT file')
+    parser.add_argument('-o', '--output', help='Path to output VTT file (optional)')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Print detailed progress information')
+
+    args = parser.parse_args()
+
+    if not os.path.exists(args.input):
+        print(f"Error: File {args.input} does not exist.")
+        return 1
+
+    if not args.output:
+        args.output = os.path.splitext(args.input)[0] + '.vtt'
+
+    success = convert_srt_to_vtt(args.input, args.output, args.verbose)
+
+    if success:
+        print(f"Created: {args.output}")
+
+    return 0 if success else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
