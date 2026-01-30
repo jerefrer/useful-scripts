@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""
+Offset odd/even pages in a PDF to compensate for duplex printing misalignment.
+
+Usage:
+    pdf-duplex-offset input.pdf --x 1.5 --y -0.5
+    pdf-duplex-offset input.pdf --config SHARP-MX-B350W.json
+    pdf-duplex-offset input.pdf --config printers/myprinter.json --even
+
+Config file format (JSON):
+{
+    "name": "SHARP MX-B350W",
+    "x_offset_mm": 1.0,
+    "y_offset_mm": 0.5,
+    "notes": "Measured 2024-01 with test grid"
+}
+"""
+
+import sys
+import os
+import json
+import argparse
+import fitz  # PyMuPDF
+
+MM_TO_POINTS = 72 / 25.4  # 1 inch = 72 points = 25.4 mm
+
+
+def offset_pages(input_pdf, output_pdf, x_mm, y_mm, offset_even=False):
+    """Apply offset to odd or even pages."""
+    doc = fitz.open(input_pdf)
+    new_doc = fitz.open()
+
+    x_pt = x_mm * MM_TO_POINTS
+    y_pt = y_mm * MM_TO_POINTS
+
+    for i, page in enumerate(doc):
+        page_num = i + 1  # 1-based
+        is_odd = page_num % 2 == 1
+
+        # Determine if this page should be offset
+        should_offset = (not offset_even and is_odd) or (offset_even and not is_odd)
+
+        new_page = new_doc.new_page(width=page.rect.width, height=page.rect.height)
+
+        if should_offset and (x_pt != 0 or y_pt != 0):
+            target = fitz.Rect(
+                x_pt,
+                y_pt,
+                page.rect.width + x_pt,
+                page.rect.height + y_pt
+            )
+            print(f"  Page {page_num}: offset ({x_mm:+.2f}, {y_mm:+.2f}) mm")
+        else:
+            target = page.rect
+            print(f"  Page {page_num}: no offset")
+
+        new_page.show_pdf_page(target, doc, i)
+
+    new_doc.save(output_pdf, garbage=4, deflate=True)
+    new_doc.close()
+    doc.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Offset odd/even PDF pages for duplex printing alignment",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s input.pdf --x 1.0 --y 0.5
+  %(prog)s input.pdf --config SHARP-MX-B350W.json
+  %(prog)s input.pdf -c myprinter.json --even -o corrected.pdf
+
+Config file format (JSON):
+  {"name": "Printer Name", "x_offset_mm": 1.0, "y_offset_mm": 0.5}
+        """
+    )
+    parser.add_argument("input", help="Input PDF file")
+    parser.add_argument("-o", "--output", help="Output PDF (default: input_duplex.pdf)")
+    parser.add_argument("-x", type=float, default=0, help="X offset in mm (positive = right)")
+    parser.add_argument("-y", type=float, default=0, help="Y offset in mm (positive = down)")
+    parser.add_argument("-c", "--config", help="Load offsets from JSON config file")
+    parser.add_argument("--even", action="store_true", help="Offset even pages instead of odd")
+    parser.add_argument("--create-config", metavar="NAME",
+                        help="Create a config file with current -x/-y values")
+
+    args = parser.parse_args()
+
+    # Load from config if specified
+    x_mm = args.x
+    y_mm = args.y
+    printer_name = None
+
+    if args.config:
+        if not os.path.exists(args.config):
+            print(f"Error: Config file not found: {args.config}")
+            sys.exit(1)
+        with open(args.config) as f:
+            config = json.load(f)
+        x_mm = config.get("x_offset_mm", 0)
+        y_mm = config.get("y_offset_mm", 0)
+        printer_name = config.get("name", args.config)
+        print(f"Loaded config: {printer_name}")
+
+    # Create config file if requested
+    if args.create_config:
+        config = {
+            "name": args.create_config,
+            "x_offset_mm": x_mm,
+            "y_offset_mm": y_mm,
+            "notes": ""
+        }
+        config_file = args.create_config.replace(" ", "-") + ".json"
+        with open(config_file, "w") as f:
+            json.dump(config, f, indent=2)
+        print(f"Created config: {config_file}")
+        if not os.path.exists(args.input):
+            sys.exit(0)
+
+    # Validate input
+    if not os.path.exists(args.input):
+        print(f"Error: File not found: {args.input}")
+        sys.exit(1)
+
+    if x_mm == 0 and y_mm == 0:
+        print("Error: No offset specified. Use -x/-y or --config")
+        sys.exit(1)
+
+    # Determine output filename
+    if args.output:
+        output_pdf = args.output
+    else:
+        base, ext = os.path.splitext(args.input)
+        output_pdf = f"{base}_duplex{ext}"
+
+    target = "even" if args.even else "odd"
+    print(f"Offsetting {target} pages: ({x_mm:+.2f}, {y_mm:+.2f}) mm")
+    print(f"Input:  {args.input}")
+    print(f"Output: {output_pdf}")
+
+    offset_pages(args.input, output_pdf, x_mm, y_mm, args.even)
+    print(f"Done: {output_pdf}")
+
+
+if __name__ == "__main__":
+    main()
