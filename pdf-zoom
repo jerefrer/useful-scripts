@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""
+Zoom PDF content while keeping page dimensions the same.
+
+Usage:
+    pdf-zoom input.pdf 1.1      # Zoom in 10% (ratio)
+    pdf-zoom input.pdf 0.9      # Zoom out 10% (ratio)
+    pdf-zoom input.pdf +10%     # Zoom in 10% (percentage)
+    pdf-zoom input.pdf -5%      # Zoom out 5% (percentage)
+"""
+
+import sys
+import os
+import re
+import argparse
+import fitz  # PyMuPDF
+
+
+def parse_zoom(zoom_str):
+    """Parse zoom as ratio (1.1) or percentage (+10%, -5%)."""
+    zoom_str = zoom_str.strip()
+
+    # Percentage format: +10%, -5%, 10%
+    if '%' in zoom_str:
+        pct = float(zoom_str.replace('%', ''))
+        return 1.0 + (pct / 100)
+
+    # Ratio format: 1.1, 0.9
+    return float(zoom_str)
+
+
+def zoom_pages(input_pdf, output_pdf, zoom):
+    """Zoom all pages by given ratio, centered."""
+    doc = fitz.open(input_pdf)
+    new_doc = fitz.open()
+
+    for i, page in enumerate(doc):
+        pw, ph = page.rect.width, page.rect.height
+
+        # Create new page with same dimensions
+        new_page = new_doc.new_page(width=pw, height=ph)
+
+        # Calculate scaled dimensions (content size after zoom)
+        scaled_w = pw * zoom
+        scaled_h = ph * zoom
+
+        # Center the scaled content on the page
+        offset_x = (pw - scaled_w) / 2
+        offset_y = (ph - scaled_h) / 2
+
+        target = fitz.Rect(
+            offset_x,
+            offset_y,
+            offset_x + scaled_w,
+            offset_y + scaled_h
+        )
+
+        new_page.show_pdf_page(target, doc, i)
+        print(f"  Page {i + 1}/{len(doc)}: zoomed {zoom:.1%}")
+
+    new_doc.save(output_pdf, garbage=4, deflate=True)
+    new_doc.close()
+    doc.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Zoom PDF content while keeping page size constant",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s input.pdf 1.1        Zoom in 10%% (ratio)
+  %(prog)s input.pdf 0.95       Zoom out 5%% (ratio)
+  %(prog)s input.pdf +10%%       Zoom in 10%% (percentage)
+  %(prog)s input.pdf -5%%        Zoom out 5%% (percentage)
+  %(prog)s input.pdf 1.05 -o zoomed.pdf
+        """
+    )
+    parser.add_argument("input", help="Input PDF file")
+    parser.add_argument("zoom", help="Zoom ratio (1.1) or percentage (+10%%, -5%%)")
+    parser.add_argument("-o", "--output", help="Output PDF (default: input_zoomed.pdf)")
+
+    args = parser.parse_args()
+
+    if not os.path.exists(args.input):
+        print(f"Error: File not found: {args.input}")
+        sys.exit(1)
+
+    try:
+        zoom = parse_zoom(args.zoom)
+    except ValueError:
+        print(f"Error: Invalid zoom value: {args.zoom}")
+        print("Use ratio (0.9, 1.1) or percentage (+10%, -5%)")
+        sys.exit(1)
+
+    if zoom <= 0:
+        print(f"Error: Zoom must be positive, got {zoom}")
+        sys.exit(1)
+
+    # Determine output filename
+    if args.output:
+        output_pdf = args.output
+    else:
+        base, ext = os.path.splitext(args.input)
+        output_pdf = f"{base}_zoomed{ext}"
+
+    direction = "in" if zoom > 1 else "out"
+    print(f"Zooming {direction}: {zoom:.1%}")
+    print(f"Input:  {args.input}")
+    print(f"Output: {output_pdf}")
+
+    zoom_pages(args.input, output_pdf, zoom)
+    print(f"Done: {output_pdf}")
+
+
+if __name__ == "__main__":
+    main()
