@@ -21,6 +21,13 @@ def _normalize_timestamp(value: object) -> str:
     if not s:
         raise ValueError("Timestamp is empty")
 
+    # Check for frame-based format (HH:MM:SS:FF at 24fps)
+    m = re.fullmatch(r"(\d{2}):(\d{2}):(\d{2}):(\d{1,2})", s)
+    if m:
+        hh, mm, ss, frames = m.groups()
+        ms = int(int(frames) * 1000 / 24)
+        return f"{hh}:{mm}:{ss},{ms:03d}"
+
     s = s.replace('.', ',')
 
     m = re.fullmatch(r"(\d{2}):(\d{2}):(\d{2}),(\d{1,6})", s)
@@ -40,7 +47,9 @@ def convert_excel_to_srt(excel_file: str, srt_file: str) -> None:
     if missing:
         raise ValueError(f"Missing required columns: {', '.join(sorted(missing))}")
 
-    df = df[list(required_cols)]
+    has_original = "Original" in df.columns
+    cols_to_keep = list(required_cols) + (["Original"] if has_original else [])
+    df = df[cols_to_keep]
 
     if df["Number"].notna().any():
         df = df.sort_values(by=["Number"], kind="stable")
@@ -50,12 +59,20 @@ def convert_excel_to_srt(excel_file: str, srt_file: str) -> None:
         begin = row.get("Begin")
         end = row.get("End")
         text = row.get("Text")
+        original = row.get("Original") if has_original else None
 
-        if pd.isna(begin) and pd.isna(end) and pd.isna(text):
+        if pd.isna(begin) and pd.isna(end) and pd.isna(text) and pd.isna(original):
             continue
 
-        if pd.isna(begin) or pd.isna(end) or pd.isna(text):
-            raise ValueError(f"Row has missing fields (Begin/End/Text): {row.to_dict()}")
+        if pd.isna(begin) or pd.isna(end):
+            raise ValueError(f"Row has missing fields (Begin/End): {row.to_dict()}")
+
+        # Use Original as fallback if Text is empty
+        if pd.isna(text) or str(text).strip() == "":
+            if has_original and not pd.isna(original) and str(original).strip():
+                text = original
+            else:
+                raise ValueError(f"Row has missing Text (and no Original fallback): {row.to_dict()}")
 
         begin_s = _normalize_timestamp(begin)
         end_s = _normalize_timestamp(end)
