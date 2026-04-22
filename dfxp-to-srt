@@ -92,7 +92,7 @@ def extract_text_from_p_element(p_elem):
     text = html.unescape(text)
     
     # Clean up the text
-    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[^\S\n]+', ' ', text)
     text = text.strip()
     
     return text
