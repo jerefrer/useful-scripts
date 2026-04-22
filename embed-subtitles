@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import json
+import re
+from pathlib import Path
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+console = Console()
+
+VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.m4v', '.webm', '.wmv', '.flv'}
+SUBTITLE_EXTENSIONS = {'.srt', '.ass', '.ssa', '.sub', '.vtt'}
+
+# Map common language codes to full names for MKV metadata
+LANG_MAP = {
+    'en': 'eng', 'eng': 'eng', 'english': 'eng',
+    'fr': 'fre', 'fre': 'fre', 'fra': 'fre', 'french': 'fre',
+    'de': 'ger', 'ger': 'ger', 'deu': 'ger', 'german': 'ger',
+    'es': 'spa', 'spa': 'spa', 'spanish': 'spa',
+    'it': 'ita', 'ita': 'ita', 'italian': 'ita',
+    'pt': 'por', 'por': 'por', 'portuguese': 'por',
+    'ja': 'jpn', 'jpn': 'jpn', 'japanese': 'jpn',
+    'ko': 'kor', 'kor': 'kor', 'korean': 'kor',
+    'zh': 'chi', 'chi': 'chi', 'zho': 'chi', 'chinese': 'chi',
+    'ru': 'rus', 'rus': 'rus', 'russian': 'rus',
+    'ar': 'ara', 'ara': 'ara', 'arabic': 'ara',
+    'nl': 'dut', 'dut': 'dut', 'nld': 'dut', 'dutch': 'dut',
+    'pl': 'pol', 'pol': 'pol', 'polish': 'pol',
+    'sv': 'swe', 'swe': 'swe', 'swedish': 'swe',
+    'da': 'dan', 'dan': 'dan', 'danish': 'dan',
+    'no': 'nor', 'nor': 'nor', 'norwegian': 'nor',
+    'fi': 'fin', 'fin': 'fin', 'finnish': 'fin',
+    'el': 'gre', 'gre': 'gre', 'ell': 'gre', 'greek': 'gre',
+    'tr': 'tur', 'tur': 'tur', 'turkish': 'tur',
+    'he': 'heb', 'heb': 'heb', 'hebrew': 'heb',
+    'hi': 'hin', 'hin': 'hin', 'hindi': 'hin',
+    'th': 'tha', 'tha': 'tha', 'thai': 'tha',
+    'vi': 'vie', 'vie': 'vie', 'vietnamese': 'vie',
+    'uk': 'ukr', 'ukr': 'ukr', 'ukrainian': 'ukr',
+    'cs': 'cze', 'cze': 'cze', 'ces': 'cze', 'czech': 'cze',
+    'ro': 'rum', 'rum': 'rum', 'ron': 'rum', 'romanian': 'rum',
+    'hu': 'hun', 'hun': 'hun', 'hungarian': 'hun',
+    'bg': 'bul', 'bul': 'bul', 'bulgarian': 'bul',
+    'hr': 'hrv', 'hrv': 'hrv', 'croatian': 'hrv',
+    'sk': 'slo', 'slo': 'slo', 'slk': 'slo', 'slovak': 'slo',
+    'sl': 'slv', 'slv': 'slv', 'slovenian': 'slv',
+    'sr': 'srp', 'srp': 'srp', 'serbian': 'srp',
+    'ms': 'may', 'may': 'may', 'msa': 'may', 'malay': 'may',
+    'id': 'ind', 'ind': 'ind', 'indonesian': 'ind',
+    'ca': 'cat', 'cat': 'cat', 'catalan': 'cat',
+    'eu': 'baq', 'baq': 'baq', 'eus': 'baq', 'basque': 'baq',
+    'ga': 'gle', 'gle': 'gle', 'irish': 'gle',
+    'cy': 'wel', 'wel': 'wel', 'cym': 'wel', 'welsh': 'wel',
+}
+
+
+def check_ffmpeg():
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        return True
+    except (subprocess.SubprocessError, FileNotFoundError):
+        console.print("[bold red]Error: ffmpeg not found. Please install ffmpeg first.")
+        return False
+
+
+def parse_lang_from_filename(video_stem, sub_path):
+    """Extract language code from subtitle filename.
+
+    Supports patterns like:
+      Movie.en.srt
+      Movie.english.srt
+      Movie.eng.srt
+    """
+    sub_stem = sub_path.stem  # e.g. "Movie.en" from "Movie.en.srt"
+
+    # Remove the video stem prefix to get the language part
+    if sub_stem.lower().startswith(video_stem.lower()):
+        remainder = sub_stem[len(video_stem):]
+        # Strip leading dots/underscores/hyphens
+        remainder = remainder.lstrip('._ -')
+        if remainder:
+            lang_key = remainder.lower()
+            return LANG_MAP.get(lang_key, lang_key)
+
+    # Fallback: check if second-to-last dot-segment is a language
+    parts = sub_stem.split('.')
+    if len(parts) >= 2:
+        lang_key = parts[-1].lower()
+        return LANG_MAP.get(lang_key, lang_key)
+
+    return 'und'  # undetermined
+
+
+def find_subtitles(video_path):
+    """Find subtitle files matching the video in the same directory."""
+    video_stem = video_path.stem
+    video_dir = video_path.parent
+    subtitles = []
+
+    for f in sorted(video_dir.iterdir()):
+        if f.suffix.lower() not in SUBTITLE_EXTENSIONS:
+            continue
+        # Match subtitles that start with the video filename
+        if f.stem.lower().startswith(video_stem.lower()):
+            lang = parse_lang_from_filename(video_stem, f)
+            subtitles.append((f, lang))
+
+    return subtitles
+
+
+def find_videos_in_folder(folder):
+    """Find all video files in a folder (non-recursive)."""
+    videos = []
+    for f in sorted(folder.iterdir()):
+        if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS:
+            videos.append(f)
+    return videos
+
+
+def embed_subtitles(video_path, subtitles, output_path):
+    """Run ffmpeg to mux video + subtitles into MKV."""
+    # Probe the video to find valid streams
+    probe = subprocess.run(
+        ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', str(video_path)],
+        capture_output=True, text=True
+    )
+    probe_data = json.loads(probe.stdout)
+    streams = probe_data.get('streams', [])
+
+    cmd = ['ffmpeg', '-i', str(video_path)]
+
+    # Add each subtitle as input
+    for sub_path, _ in subtitles:
+        cmd.extend(['-i', str(sub_path)])
+
+    # Map only video, audio, and subtitle streams from the source
+    # (skip data/attachment streams that MKV may reject)
+    for s in streams:
+        if s['codec_type'] in ('video', 'audio', 'subtitle'):
+            cmd.extend(['-map', f'0:{s["index"]}'])
+
+    # Map each subtitle input
+    for i in range(len(subtitles)):
+        cmd.extend(['-map', str(i + 1)])
+
+    # Copy all streams without re-encoding
+    cmd.extend(['-c', 'copy'])
+
+    # Set language metadata for each new subtitle track
+    existing_sub_count = sum(1 for s in streams if s['codec_type'] == 'subtitle')
+
+    for i, (_, lang) in enumerate(subtitles):
+        stream_idx = existing_sub_count + i
+        cmd.extend([f'-metadata:s:s:{stream_idx}', f'language={lang}'])
+
+    cmd.extend(['-y', str(output_path)])
+
+    console.print(f"  [dim]Running: ffmpeg with {len(subtitles)} subtitle(s)[/dim]")
+
+    process = subprocess.run(cmd, capture_output=True, text=True)
+    if process.returncode != 0:
+        console.print(f"[red]ffmpeg error:\n{process.stderr[-500:]}")
+        return False
+    return True
+
+
+def process_video(video_path):
+    """Process a single video file: find subs, embed, output MKV."""
+    subtitles = find_subtitles(video_path)
+
+    if not subtitles:
+        console.print(f"[yellow]No subtitles found for {video_path.name}")
+        return False
+
+    # Output in same directory, same name but .mkv
+    if video_path.suffix.lower() == '.mkv':
+        output_path = video_path.with_stem(video_path.stem + '_with_subs')
+    else:
+        output_path = video_path.with_suffix('.mkv')
+
+    # Show what we found
+    table = Table(title=f"Subtitles for {video_path.name}", show_header=True)
+    table.add_column("File", style="cyan")
+    table.add_column("Language", style="green")
+    for sub_path, lang in subtitles:
+        table.add_row(sub_path.name, lang)
+    console.print(table)
+
+    success = embed_subtitles(video_path, subtitles, output_path)
+
+    if success:
+        size = output_path.stat().st_size / (1024 * 1024)
+        console.print(f"[green]Created: {output_path.name} ({size:.1f} MB)")
+    return success
+
+
+def main():
+    if len(sys.argv) != 2:
+        console.print(Panel(
+            "[bold red]Error:[/bold red] Missing argument\n\n"
+            f"Usage: {sys.argv[0]} <movie_file_or_folder>\n\n"
+            "Finds subtitle files matching the movie (e.g. Movie.en.srt, Movie.fr.srt)\n"
+            "and creates an MKV with all subtitles embedded.\n\n"
+            "If a folder is given, processes all video files in it.",
+            title="Embed Subtitles",
+            border_style="red"
+        ))
+        sys.exit(1)
+
+    if not check_ffmpeg():
+        sys.exit(1)
+
+    target = Path(sys.argv[1]).resolve()
+
+    if target.is_file():
+        if target.suffix.lower() not in VIDEO_EXTENSIONS:
+            console.print(f"[red]Not a recognized video file: {target.name}")
+            sys.exit(1)
+        success = process_video(target)
+        sys.exit(0 if success else 1)
+
+    elif target.is_dir():
+        videos = find_videos_in_folder(target)
+        if not videos:
+            console.print(f"[yellow]No video files found in {target}")
+            sys.exit(1)
+
+        console.print(Panel(f"Found {len(videos)} video(s) in {target.name}", border_style="blue"))
+        results = []
+        for video in videos:
+            results.append(process_video(video))
+            console.print()
+
+        succeeded = sum(results)
+        console.print(Panel(
+            f"[green]{succeeded}[/green] / {len(videos)} videos processed",
+            border_style="green" if all(results) else "yellow"
+        ))
+        sys.exit(0 if all(results) else 1)
+
+    else:
+        console.print(f"[red]Not found: {target}")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
